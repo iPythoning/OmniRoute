@@ -27,3 +27,11 @@
 - `tests/unit/prepaid-inference.test.ts` exercises the real auth pipeline, search POST route and SQLite ledger with a mocked upstream: conflicting credential pairs never dispatch; each accepted header/same-key combination charges only its own account once; deleted keys never dispatch; spoofed anonymous stamps are overwritten.
 - Verification: four focused files (`prepaid-inference`, `api-key-policy`, `auth-policy-embeddings-webfetch-7785`, `search-route`) passed 87/87; `npm run typecheck:core` passed. This also reran the previously unverified ledger-history/refund case successfully.
 - Scope remains local on `feat/prepaid-idempotency-20261004`; full-suite/CI/build and production acceptance remain open. Next: complete the remaining WIP acceptance before publishing or deploying; broader production work stays paused.
+
+## Deployment resume — 2026-10-04
+
+- Operator requested deployment and approved completing acceptance plus a fork-owned image/rollback pipeline first. Production is unchanged; never use the upstream PM2 deploy workflow for pulse's Docker service.
+- Preflight reproduced the unclassified prepaid executor gate; its call wraps chatCore's existing lease-fenced executor and is now classified A. Route-body validation passed.
+- Real handler/SQLite regressions reproduced input audio accepted at HTTP 200 and one internal audio-bridge dispatch before parent billing. Prepaid input audio/video now rejects before guardrails; unmetered modality bridges are disabled for prepaid callers. Focused inference/lease tests passed 38/38; core typecheck and docs checks passed (91 historical advisory version hints).
+- Audit caveat: sql.js overwrite and restore interleaving findings used mocked filesystems, not native ledger reproductions. Pulse runtime probe reports Node v26.7.0 with both better-sqlite3 and node:sqlite available; mixed-driver exposure is not established. Native restore concurrency acceptance remains open.
+- Remaining release blockers: billing receipt propagation, ZAI MCP handshake compatibility, financial restore/adapters and full CI/build/production model compatibility. Local disk has about 1.3 GiB free; do not rerun the full suite into ENOSPC or delete unrelated workspaces.

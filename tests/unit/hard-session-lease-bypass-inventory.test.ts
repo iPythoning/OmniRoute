@@ -69,6 +69,8 @@ const EXPECTED: Record<InventoryKind, Record<string, number>> = {
     "open-sse/handlers/videoGeneration.ts": 1,
     "open-sse/services/compression/eval/executorModelClient.ts": 1,
     "src/lib/compression/judgeModelClient.ts": 1,
+    // Wraps the already-fenced chatCore executor; it never resolves another connection.
+    "src/lib/prepaid/inference.ts": 1,
     "src/lib/services/quotaAutoPing.ts": 1,
   },
   connection: {
@@ -186,6 +188,7 @@ const CLASSIFICATION: Record<InventoryKind, Record<string, BypassClass>> = {
     "open-sse/handlers/videoGeneration.ts": "B",
     "open-sse/services/compression/eval/executorModelClient.ts": "B",
     "src/lib/compression/judgeModelClient.ts": "B",
+    "src/lib/prepaid/inference.ts": "A",
     "src/lib/services/quotaAutoPing.ts": "B",
   },
   connection: Object.fromEntries(

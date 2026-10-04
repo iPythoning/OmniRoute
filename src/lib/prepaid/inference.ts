@@ -23,6 +23,7 @@ import { CliproxyapiExecutor } from "@omniroute/open-sse/executors/cliproxyapi";
 import { DarioExecutor } from "@omniroute/open-sse/executors/dario";
 import { normalizeExecutorResult } from "@omniroute/open-sse/handlers/chatCore/upstreamTimeouts";
 import { runWithSingleDispatch } from "@omniroute/open-sse/utils/proxyFetch";
+import { containsMediaKind } from "@omniroute/open-sse/utils/mediaParts";
 
 type Usage = Record<string, number | undefined>;
 type BillingQuote = {
@@ -53,6 +54,22 @@ export function assertPrepaidChatBody(value: unknown): asserts value is Record<s
     throw new PrepaidInferenceError(400);
   const body = value as Record<string, unknown>;
   const generationConfig = body.generationConfig as Record<string, unknown> | undefined;
+  const messages = [body.messages, body.input].flatMap((items) =>
+    Array.isArray(items) ? items.map((item) => ({ content: item?.content ?? [item] })) : []
+  );
+  const nativeParts = Array.isArray(body.contents)
+    ? body.contents.flatMap((item) => (Array.isArray(item?.parts) ? item.parts : []))
+    : [];
+  if (
+    containsMediaKind(messages, "audio") ||
+    containsMediaKind(messages, "video") ||
+    nativeParts.some((part) => {
+      const data = part?.inlineData ?? part?.inline_data ?? part?.fileData ?? part?.file_data;
+      const mime = data?.mimeType ?? data?.mime_type;
+      return typeof mime === "string" && /^(audio|video)\//i.test(mime);
+    })
+  )
+    throw new PrepaidInferenceError(400);
   // Only client-executed function declarations have token-only billing.
   const toolFields = new Set([
     "type",
@@ -112,6 +129,8 @@ function validateRawUsage(payload: Record<string, unknown>): void {
     if (value == null) return;
     if (typeof value !== "object" || Array.isArray(value)) throw new PrepaidInferenceError();
     for (const [field, count] of Object.entries(value)) {
+      if ((field === "audio_tokens" || field === "video_tokens") && count !== 0)
+        throw new PrepaidInferenceError();
       if (
         field.endsWith("_tokens") ||
         field.endsWith("TokenCount") ||

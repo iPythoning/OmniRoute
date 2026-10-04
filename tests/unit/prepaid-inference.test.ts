@@ -459,11 +459,17 @@ test("JSON and SSE retain cache creation costs and reject malformed billing dime
       );
       await result.response.text();
       assert.equal(ledger.getPrepaidBalance(key.id)?.balanceUsd, "0.999720000");
-      for (const reasoning_tokens of ["invalid", 0.5, -1]) {
+      for (const details of [
+        { reasoning_tokens: "invalid" },
+        { reasoning_tokens: 0.5 },
+        { reasoning_tokens: -1 },
+        { audio_tokens: 90 },
+        { video_tokens: 90 },
+      ]) {
         const badKey = await funded();
         const invalid = {
           ...payload,
-          usage: { ...payload.usage, completion_tokens_details: { reasoning_tokens } },
+          usage: { ...payload.usage, completion_tokens_details: details },
         };
         const bad = await invoke(
           badKey.id,
@@ -636,6 +642,45 @@ test("prepaid native tools and extra billing dimensions are rejected before fall
       { generationConfig: { candidateCount: 2 } },
       { web_search_options: {} },
       { modalities: ["text", "audio"] },
+      {
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "input_audio", input_audio: { data: "AAAA", format: "wav" } }],
+          },
+        ],
+      },
+      {
+        input: [
+          {
+            role: "user",
+            content: [{ type: "audio_url", audio_url: "https://example.test/clip.wav" }],
+          },
+        ],
+      },
+      {
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "input_video", video_url: "https://example.test/clip.mp4" }],
+          },
+        ],
+      },
+      {
+        contents: [
+          { role: "user", parts: [{ inlineData: { mimeType: "audio/wav", data: "AAAA" } }] },
+        ],
+      },
+      {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { file_data: { mime_type: "video/mp4", file_uri: "https://example.test/clip.mp4" } },
+            ],
+          },
+        ],
+      },
       { best_of: 2 },
     ]) {
       const body = {
@@ -665,6 +710,52 @@ test("prepaid native tools and extra billing dimensions are rejected before fall
     assert.equal(ledger.getPrepaidBalance(key.id)?.reservedUsd, "0.000000000");
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("prepaid requests reject input audio before an enabled bridge can dispatch under an internal key", async () => {
+  const { handleChat } = await import("../../src/sse/handlers/chat.ts");
+  const { guardrailRegistry } = await import("../../src/lib/guardrails/registry.ts");
+  const { AudioBridgeGuardrail } = await import("../../src/lib/guardrails/audioBridge.ts");
+  const key = await funded("0.000000001");
+  const previous = guardrailRegistry.list();
+  let childCalls = 0;
+  guardrailRegistry.register(
+    new AudioBridgeGuardrail({
+      enabled: true,
+      deps: {
+        getSettings: async () => ({ audioBridgeEnabled: true }),
+        getCapabilities: () => ({ supportsAudio: false }),
+        selectModel: async () => "fixture/transcription",
+        callTranscription: async () => {
+          childCalls++;
+          return "transcribed";
+        },
+      },
+    })
+  );
+  try {
+    const response = await handleChat(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key.key}` },
+        body: JSON.stringify({
+          model: "openai/gpt-4o",
+          messages: [
+            {
+              role: "user",
+              content: [{ type: "input_audio", input_audio: { data: "AAAA", format: "wav" } }],
+            },
+          ],
+        }),
+      })
+    );
+    assert.equal(childCalls, 0);
+    assert.equal(response.status, 400);
+    assert.equal(ledger.getPrepaidBalance(key.id)?.availableUsd, "0.000000001");
+  } finally {
+    guardrailRegistry.clear();
+    previous.forEach((guardrail) => guardrailRegistry.register(guardrail));
   }
 });
 
