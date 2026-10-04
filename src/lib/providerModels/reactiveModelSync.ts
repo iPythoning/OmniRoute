@@ -41,7 +41,11 @@ let syncFn: SyncFn = defaultSyncFn;
  * and the connection is not cooling down / already syncing. Returns true when
  * a sync was scheduled (fire-and-forget), false when the call was a no-op.
  */
-export function maybeTriggerReactiveModelSync(provider: string, connectionId: string): boolean {
+export function maybeTriggerReactiveModelSync(
+  provider: string,
+  connectionId: string | null | undefined
+): boolean {
+  if (!connectionId) return false;
   const providerId = provider.trim().toLowerCase();
   const connection = connectionId.trim();
   if (!REACTIVE_SYNC_PROVIDERS.has(providerId) || !connection) return false;

@@ -27,6 +27,13 @@ export function ensureProviderConnectionsColumns(db: SqliteDatabase) {
       ["rate_limit_protection", "INTEGER DEFAULT 0"],
       ["last_used_at", "TEXT"],
       ["default_model", "TEXT"], // legacy-schema hole; later data migrations read it
+      // Retirement migrations also read these initial-schema fields on legacy tables.
+      ["test_status", "TEXT"],
+      ["error_code", "TEXT"],
+      ["last_error", "TEXT"],
+      ["last_error_at", "TEXT"],
+      ["last_error_type", "TEXT"],
+      ["last_error_source", "TEXT"],
     ]) {
       if (!columnNames.has(column)) {
         db.exec(`ALTER TABLE provider_connections ADD COLUMN ${column} ${type}`);

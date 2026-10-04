@@ -61,6 +61,8 @@ test("providers without discovery support never trigger", async () => {
   assert.equal(maybeTriggerReactiveModelSync("openai", "conn-ccc-333"), false);
   assert.equal(maybeTriggerReactiveModelSync("", "conn-ccc-333"), false);
   assert.equal(maybeTriggerReactiveModelSync("antigravity", "  "), false);
+  assert.equal(maybeTriggerReactiveModelSync("antigravity", undefined), false);
+  assert.equal(maybeTriggerReactiveModelSync("antigravity", null), false);
   await flushMicrotasks();
   assert.equal(calls.length, 0);
 });
