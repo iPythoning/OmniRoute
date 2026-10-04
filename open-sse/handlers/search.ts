@@ -44,6 +44,7 @@ import { sanitizeErrorMessage } from "../utils/error.ts";
 import { isValidContext7LibraryId } from "../executors/context7-fetch.ts";
 import { resolveSearchProxy, executeProviderFetch } from "./search/searchProxy.ts";
 import { formatSearchProviderFailure } from "./search/providerFailure.ts";
+import { executePrepaidSearch } from "@/lib/prepaid/search";
 
 export interface SearchResult {
   title: string;
@@ -1700,6 +1701,12 @@ async function tryDuckDuckGoFreeProvider(
 }
 
 async function tryProvider(
+  ...args: Parameters<typeof tryProviderUnmetered>
+): Promise<SearchHandlerResult> {
+  return executePrepaidSearch(args[6], args[0], () => tryProviderUnmetered(...args));
+}
+
+async function tryProviderUnmetered(
   config: SearchProviderConfig,
   params: Omit<SearchRequestParams, "token">,
   credentials: Record<string, any>,

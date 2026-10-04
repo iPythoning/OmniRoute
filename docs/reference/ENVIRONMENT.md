@@ -17,6 +17,12 @@ lastUpdated: 2026-08-18
 
 ---
 
+Build identity: `OMNIROUTE_SW_BUILD_ID` optionally pins the public PWA service-worker
+version. `next.config.mjs` and `scripts/build/assembleStandalone.mjs` use it first,
+then `SOURCE_VERSION`, then the build timestamp. `NEXT_PUBLIC_SW_BUILD_ID` is the
+generated browser-visible value, not a runtime override. Rebuild after changing
+the inputs; none of these values may contain secrets.
+
 ## Table of Contents
 
 - [1. Required Secrets](#1-required-secrets)

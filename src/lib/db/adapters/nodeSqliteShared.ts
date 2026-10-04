@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import type { PreparedStatement, RunResult, SqliteAdapter } from "./types";
 
 export interface NodeSqliteDatabaseLike {
@@ -219,10 +218,7 @@ export function createNodeSqliteAdapterFromDatabase(
         return;
       }
 
-      try {
-        db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-      } catch {}
-      await fs.promises.copyFile(filePath, destination);
+      db.prepare("VACUUM INTO ?").run(destination);
     },
     checkpoint(mode = "TRUNCATE"): void {
       try {

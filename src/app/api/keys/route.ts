@@ -3,9 +3,9 @@ import {
   getApiKeys,
   getApiKeysCount,
   createApiKey,
-  isCloudEnabled,
-  updateApiKeyPermissions,
-} from "@/lib/localDb";
+  ApiKeyIssuanceConflictError,
+} from "@/lib/db/apiKeys";
+import { isCloudEnabled } from "@/lib/db/settings";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { createKeySchema } from "@/shared/validation/schemas";
@@ -14,6 +14,8 @@ import { isApiKeyRevealEnabled, maskStoredApiKey } from "@/lib/apiKeyExposure";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { normalizeSelfServiceScopesForCreate } from "@/shared/constants/selfServiceScopes";
 import * as log from "@/sse/utils/logger";
+import { idempotencyKeySchema } from "@/shared/validation/schemas/keys";
+import { buildErrorBody } from "@omniroute/open-sse/utils/error";
 
 function parsePagination(request: Request) {
   const url = new URL(request.url);
@@ -57,11 +59,17 @@ export async function GET(request: Request) {
 }
 
 // POST /api/keys - Create new API key
-export async function POST(request) {
+export async function POST(request: Request) {
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
 
   try {
+    const idempotencyKey = request.headers.get("Idempotency-Key") ?? undefined;
+    if (idempotencyKey !== undefined && !idempotencyKeySchema.safeParse(idempotencyKey).success) {
+      return NextResponse.json(buildErrorBody(400, "Idempotency-Key must be a UUID"), {
+        status: 400,
+      });
+    }
     const body = await request.json();
 
     // Zod validation
@@ -69,39 +77,19 @@ export async function POST(request) {
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const {
-      name,
-      noLog,
-      scopes,
-      allowedConnections,
-      allowUsageCommand,
-      usageLimitEnabled,
-      dailyUsageLimitUsd,
-      weeklyUsageLimitUsd,
-      chaosModeEnabled,
-    } = validation.data;
+    const { name, scopes, ...options } = validation.data;
+    if (idempotencyKey || options.prepaidEnabled) {
+      const issuanceAuthError = await requireManagementAuth(request, { alwaysRequireAuth: true });
+      if (issuanceAuthError) return issuanceAuthError;
+    }
 
     // Always get machineId from server
     const machineId = await getConsistentMachineId();
     const normalizedScopes = normalizeSelfServiceScopesForCreate(scopes);
-    const apiKey = await createApiKey(name, machineId, normalizedScopes, { allowedConnections });
-    if (
-      noLog === true ||
-      allowUsageCommand === true ||
-      usageLimitEnabled === true ||
-      dailyUsageLimitUsd !== undefined ||
-      weeklyUsageLimitUsd !== undefined ||
-      chaosModeEnabled === true
-    ) {
-      await updateApiKeyPermissions(apiKey.id, {
-        ...(noLog === true && { noLog: true }),
-        ...(allowUsageCommand === true && { allowUsageCommand: true }),
-        ...(usageLimitEnabled === true && { usageLimitEnabled: true }),
-        ...(dailyUsageLimitUsd !== undefined && { dailyUsageLimitUsd }),
-        ...(weeklyUsageLimitUsd !== undefined && { weeklyUsageLimitUsd }),
-        ...(chaosModeEnabled === true && { chaosModeEnabled: true }),
-      });
-    }
+    const apiKey = await createApiKey(name, machineId, normalizedScopes, {
+      ...options,
+      idempotencyKey,
+    });
 
     // Auto sync to Cloud if enabled — fire-and-forget. Cloud sync is a
     // background side-effect, not part of the key-creation contract, and it
@@ -111,7 +99,7 @@ export async function POST(request) {
     // would hang until the fetch settled or timed out (#6570). Errors inside
     // syncKeysToCloudIfEnabled() are already caught and logged internally, so
     // this is safe to leave unawaited.
-    void syncKeysToCloudIfEnabled();
+    if (!apiKey.replayed) void syncKeysToCloudIfEnabled();
 
     return NextResponse.json(
       {
@@ -120,21 +108,38 @@ export async function POST(request) {
         id: apiKey.id,
         machineId: apiKey.machineId,
         allowedConnections: apiKey.allowedConnections,
-        noLog: noLog === true,
-        allowUsageCommand: allowUsageCommand === true,
-        usageLimitEnabled: usageLimitEnabled === true,
-        dailyUsageLimitUsd: dailyUsageLimitUsd ?? null,
-        weeklyUsageLimitUsd: weeklyUsageLimitUsd ?? null,
-        chaosModeEnabled: chaosModeEnabled === true,
-        streamDefaultMode: "legacy",
-        compressionEnabled: true,
-        cacheDefaultMode: "legacy",
+        noLog: apiKey.noLog,
+        allowUsageCommand: apiKey.allowUsageCommand,
+        usageLimitEnabled: apiKey.usageLimitEnabled,
+        dailyUsageLimitUsd: apiKey.dailyUsageLimitUsd,
+        weeklyUsageLimitUsd: apiKey.weeklyUsageLimitUsd,
+        chaosModeEnabled: apiKey.chaosModeEnabled,
+        streamDefaultMode: apiKey.streamDefaultMode,
+        compressionEnabled: apiKey.compressionEnabled,
+        cacheDefaultMode: apiKey.cacheDefaultMode,
+        modelAccessMode: apiKey.modelAccessMode,
+        allowedModels: apiKey.allowedModels,
+        allowedCombos: apiKey.allowedCombos,
+        isActive: apiKey.isActive,
+        prepaidEnabled: apiKey.prepaidEnabled,
       },
-      { status: 201 }
+      { status: apiKey.replayed ? 200 : 201, headers: { "Cache-Control": "no-store" } }
     );
   } catch (error) {
+    if (error instanceof SyntaxError) {
+      return NextResponse.json(buildErrorBody(400, "Invalid JSON request"), { status: 400 });
+    }
+    if (error instanceof ApiKeyIssuanceConflictError) {
+      return NextResponse.json(
+        buildErrorBody(
+          409,
+          "Issuance request conflicts with an existing receipt or retired credential"
+        ),
+        { status: 409 }
+      );
+    }
     log.error("keys", "Error creating key", error);
-    return NextResponse.json({ error: "Failed to create key" }, { status: 500 });
+    return NextResponse.json(buildErrorBody(500, "Failed to create key"), { status: 500 });
   }
 }
 

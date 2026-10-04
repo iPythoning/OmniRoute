@@ -3313,6 +3313,25 @@ function readNonEmptyUrlToken(request: AuthRequestLike): string | null {
  * authenticate a management route (it leaks into logs/Referer and would widen
  * the management surface). See the #3300 security follow-up.
  */
+export function resolveClientApiKey(request: AuthRequestLike): {
+  key: string | null;
+  conflicting: boolean;
+} {
+  const authorization = readHeaderValue(request?.headers, "authorization")?.trim();
+  const bearer = authorization?.toLowerCase().startsWith("bearer ")
+    ? authorization.slice(7).trim()
+    : null;
+  const keys = [
+    bearer,
+    readHeaderValue(request?.headers, "x-api-key")?.trim(),
+    extractGoogApiKeyHeader(request?.headers),
+  ].filter((value): value is string => Boolean(value));
+  return {
+    key: keys[0] || extractApiKey(request),
+    conflicting: new Set(keys).size > 1,
+  };
+}
+
 export function extractApiKey(request: AuthRequestLike, opts?: { allowUrl?: boolean }) {
   const authHeader =
     readHeaderValue(request?.headers, "Authorization") ||

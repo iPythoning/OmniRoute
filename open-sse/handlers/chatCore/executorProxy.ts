@@ -82,11 +82,14 @@ async function loadCliproxyapiSettings(): Promise<{
  */
 async function resolveCliproxyapiExecutor(
   cliproxyapiModelMapping: Record<string, unknown> | null,
-  dedicatedApiKey: string | null
+  dedicatedApiKey: string | null,
+  wrapAttempt: (
+    executor: Awaited<ReturnType<typeof getExecutor>>
+  ) => Awaited<ReturnType<typeof getExecutor>>
 ) {
   return wrapExecutorWithCliproxyapiCredentials(
     wrapExecutorWithCliproxyapiModelMapping(
-      await getExecutor("cliproxyapi"),
+      wrapAttempt(await getExecutor("cliproxyapi")),
       cliproxyapiModelMapping
     ),
     dedicatedApiKey
@@ -96,7 +99,10 @@ async function resolveCliproxyapiExecutor(
 export async function resolveExecutorWithProxy(
   prov: string,
   log?: LoggerLike,
-  providerSpecificData?: Record<string, unknown> | null
+  providerSpecificData?: Record<string, unknown> | null,
+  wrapAttempt: (
+    executor: Awaited<ReturnType<typeof getExecutor>>
+  ) => Awaited<ReturnType<typeof getExecutor>> = (executor) => executor
 ) {
   assertMicrosoftDesignerWebProviderAvailable(prov);
   assertRuntimeProviderAvailable(prov);
@@ -117,7 +123,7 @@ export async function resolveExecutorWithProxy(
       getUpstreamProxyConfigCached(prov),
       loadCliproxyapiSettings(),
     ]);
-    return resolveCliproxyapiExecutor(cfg.cliproxyapiModelMapping, dedicatedApiKey);
+    return resolveCliproxyapiExecutor(cfg.cliproxyapiModelMapping, dedicatedApiKey, wrapAttempt);
   }
 
   // Sibling per-connection override for Dario (#dario). Checked AFTER the
@@ -130,30 +136,30 @@ export async function resolveExecutorWithProxy(
       "UPSTREAM_PROXY",
       `${prov} routed through Dario (per-connection claude-native override)`
     );
-    return getExecutor("dario");
+    return wrapAttempt(await getExecutor("dario"));
   }
 
   const cfg = await getUpstreamProxyConfigCached(prov);
-  if (!cfg.enabled || cfg.mode === "native") return getExecutor(prov);
+  if (!cfg.enabled || cfg.mode === "native") return wrapAttempt(await getExecutor(prov));
 
   if (cfg.mode === "cliproxyapi") {
     log?.info?.("UPSTREAM_PROXY", `${prov} routed through CLIProxyAPI (passthrough)`);
     const { dedicatedApiKey } = await loadCliproxyapiSettings();
-    return resolveCliproxyapiExecutor(cfg.cliproxyapiModelMapping, dedicatedApiKey);
+    return resolveCliproxyapiExecutor(cfg.cliproxyapiModelMapping, dedicatedApiKey, wrapAttempt);
   }
 
   if (cfg.mode === "dario") {
     // Direct Dario passthrough. No credential/model-mapping wrappers: Dario
     // authenticates via its own OAuth pool and has its own model-alias layer.
     log?.info?.("UPSTREAM_PROXY", `${prov} routed through Dario (passthrough)`);
-    return getExecutor("dario");
+    return wrapAttempt(await getExecutor("dario"));
   }
 
   // mode === "fallback": try native first, retry via the configured fallback
   // backend on specific failures. The backend defaults to CLIProxyAPI so every
   // pre-existing fallback config behaves exactly as before; fallbackBackend
   // === "dario" opts the retry leg over to Dario instead.
-  const nativeExec = await getExecutor(prov);
+  const nativeExec = wrapAttempt(await getExecutor(prov));
   const fallbackBackend: FallbackBackend = cfg.fallbackBackend;
   const { fallbackCodes, dedicatedApiKey } = await loadCliproxyapiSettings();
 
@@ -161,8 +167,8 @@ export async function resolveExecutorWithProxy(
   // the native leg must keep seeing the original, unmapped model.
   const proxyExec =
     fallbackBackend === "dario"
-      ? await getExecutor("dario")
-      : await resolveCliproxyapiExecutor(cfg.cliproxyapiModelMapping, dedicatedApiKey);
+      ? wrapAttempt(await getExecutor("dario"))
+      : await resolveCliproxyapiExecutor(cfg.cliproxyapiModelMapping, dedicatedApiKey, wrapAttempt);
   const backendLabel = fallbackBackend === "dario" ? "Dario" : "CLIProxyAPI";
   const isRetryableStatus = (s: number) => fallbackCodes.includes(s) || s === 0;
 

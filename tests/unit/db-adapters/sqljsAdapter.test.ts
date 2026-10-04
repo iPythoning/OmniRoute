@@ -3,6 +3,34 @@ import assert from "node:assert/strict";
 
 const { createSqlJsAdapter } = await import("../../../src/lib/db/adapters/sqljsAdapter.ts");
 
+test("sql.js refuses financial snapshots before scheduling a writer", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { default: Database } = await import("better-sqlite3");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prepaid-sqljs-"));
+  const file = path.join(dir, "storage.sqlite");
+  const db = new Database(file);
+  try {
+    db.exec(fs.readFileSync("src/lib/db/migrations/170_prepaid_accounts.sql", "utf8"));
+    db.prepare("INSERT INTO prepaid_accounts VALUES (?, ?, ?, ?)").run(
+      "fixture",
+      1000000000,
+      0,
+      new Date().toISOString()
+    );
+    const before = fs.readFileSync(file);
+    await assert.rejects(async () => {
+      const adapter = await createSqlJsAdapter(file);
+      adapter.close();
+    }, /Financial state requires a native SQLite driver/);
+    assert.deepEqual(fs.readFileSync(file), before);
+  } finally {
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 describe("sqljsAdapter", () => {
   test("abre DB in-memory e executa CRUD básico", async () => {
     const adapter = await createSqlJsAdapter(":memory:");
@@ -107,8 +135,7 @@ describe("sqljsAdapter", () => {
         .prepare("INSERT INTO provider_connections (provider, is_active) VALUES (?, ?)")
         .run("openai", 0);
 
-      const sql =
-        "SELECT * FROM provider_connections WHERE is_active = @isActive ORDER BY id ASC";
+      const sql = "SELECT * FROM provider_connections WHERE is_active = @isActive ORDER BY id ASC";
       const rows = adapter.prepare(sql).all({ isActive: 1 }) as Array<{ provider: string }>;
 
       assert.equal(rows.length, 1, "expected exactly 1 active provider connection");
@@ -131,14 +158,12 @@ describe("sqljsAdapter", () => {
     test("run() with a single named-params object binds correctly", async () => {
       const adapter = await createSqlJsAdapter(":memory:");
       adapter.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
-      const result = adapter
-        .prepare("INSERT INTO t (val) VALUES (@val)")
-        .run({ val: "named-run" });
+      const result = adapter.prepare("INSERT INTO t (val) VALUES (@val)").run({ val: "named-run" });
       assert.equal(result.changes, 1);
 
-      const row = adapter
-        .prepare("SELECT val FROM t WHERE id = ?")
-        .get(result.lastInsertRowid) as { val: string };
+      const row = adapter.prepare("SELECT val FROM t WHERE id = ?").get(result.lastInsertRowid) as {
+        val: string;
+      };
       assert.equal(row.val, "named-run");
       adapter.close();
     });

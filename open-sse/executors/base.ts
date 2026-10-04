@@ -211,6 +211,7 @@ export type ExecuteInput = {
   ) => Promise<void> | void;
   /** When true, skip the intra-URL 429 retry in execute() so the caller handles fallback. */
   skipUpstreamRetry?: boolean;
+  singleDispatch?: boolean;
   /** Delegated Context Editing (Claude only): when enabled, attach the
    * `context_management.clear_tool_uses` strategy so the provider clears stale
    * tool-use blocks server-side. Honored only on the genuine `claude` path. */
@@ -1482,6 +1483,10 @@ export class BaseExecutor {
 
         if (openrouterFreeWindowAccountKey) {
           correctFromRateLimitHeaders(openrouterFreeWindowAccountKey, response.headers);
+        }
+
+        if (input.singleDispatch) {
+          return { response, url, headers: finalHeaders, transformedBody: serializedBody };
         }
 
         // Context Editing 400-fallback for Claude-compatible relays.

@@ -32,6 +32,9 @@ export function extractUsageFromResponse(responseBody, provider) {
         responseBody.usage.completion_tokens_details?.reasoning_tokens ??
         responseBody.usage.output_tokens_details?.reasoning_tokens ??
         responseBody.usage.reasoning_tokens,
+      ...(responseBody.usage.cache_creation_input_tokens !== undefined
+        ? { cache_creation_input_tokens: responseBody.usage.cache_creation_input_tokens }
+        : {}),
       // xAI's exact provider-reported cost (port of decolua/9router#2453, capability A —
       // @ryanngit). Only set the key when present so non-xAI OpenAI-shaped usage
       // (Codex, DeepSeek, etc.) is unaffected. Ticks → USD conversion happens in
@@ -46,7 +49,7 @@ export function extractUsageFromResponse(responseBody, provider) {
 
   // Claude format
   if (
-    isClaudeProvider &&
+    (isClaudeProvider || responseBody.type === "message") &&
     responseBody.usage &&
     typeof responseBody.usage === "object" &&
     (responseBody.usage.input_tokens !== undefined ||

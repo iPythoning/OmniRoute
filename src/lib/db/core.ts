@@ -18,6 +18,7 @@ import fs from "fs";
 import { resolveWritableDataDir, getLegacyDotDataDir } from "../dataPaths";
 import { isNextBuildPhase } from "../buildPhase";
 import { runMigrations } from "./migrationRunner";
+import { hasFinancialState, FinancialStateRecoveryError } from "./financialState";
 import { runDbHealthCheck } from "./healthCheck";
 import { resetAllDbModuleState } from "./stateReset";
 import { parseStoredPayload } from "../logPayloads";
@@ -597,6 +598,11 @@ function captureCriticalDbState(sqliteFile: string): PreservedCriticalDbState {
   try {
     probe = openSqliteDatabase(sqliteFile, { readonly: true });
 
+    // Selective configuration salvage cannot establish ledger/receipt completeness.
+    // Preserve the original file and require a full restore rather than resurrecting
+    // an unmetered key or allowing an already acknowledged issuance to run twice.
+    if (hasFinancialState(probe)) throw new FinancialStateRecoveryError();
+
     for (const tableSpec of CRITICAL_DB_TABLES) {
       if (!hasTable(probe, tableSpec.table)) continue;
 
@@ -1164,6 +1170,10 @@ export function getDbInstance(): SqliteDatabase {
         .get();
 
       if (hasOldSchema) {
+        if (hasFinancialState(probe)) {
+          closeProbeIfSafe(probe);
+          throw new FinancialStateRecoveryError();
+        }
         let hasData = false;
         try {
           const count = probe.prepare("SELECT COUNT(*) as c FROM provider_connections").get() as
@@ -1206,6 +1216,7 @@ export function getDbInstance(): SqliteDatabase {
         closeProbeIfSafe(probe);
       }
     } catch (e: unknown) {
+      if (e instanceof FinancialStateRecoveryError) throw e;
       const message = e instanceof Error ? e.message : String(e);
       console.warn("[DB] Could not probe existing DB:", message);
 
@@ -1252,6 +1263,10 @@ export function getDbInstance(): SqliteDatabase {
       }
       if (!retryProbeIfTransient(sqliteFile, e, openSqliteDatabase, closeProbeIfSafe)) {
         preservedCriticalState = captureCriticalDbState(sqliteFile);
+        if (preservedCriticalState.captureError === new FinancialStateRecoveryError().message) {
+          // Keep the main file and its WAL together at their original paths.
+          throw new FinancialStateRecoveryError();
+        }
         // SAFETY: Never delete the database — rename to backup so data can be recovered.
         // The old code would silently destroy all user data on any probe failure.
         const failedPath = sqliteFile + `.probe-failed-${Date.now()}`;

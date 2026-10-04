@@ -534,35 +534,39 @@ test("build phase returns the no-op stub without creating sqlite files", serial,
   }
 });
 
-test("invalid DATA_DIR (a file where a dir is expected) surfaces as a startup failure", serial, async () => {
-  const sandboxDir = makeTempDir("omniroute-db-bad-path-");
-  const fileAsDir = path.join(sandboxDir, "not-a-directory");
-  fs.writeFileSync(fileAsDir, "blocked");
+test(
+  "invalid DATA_DIR (a file where a dir is expected) surfaces as a startup failure",
+  serial,
+  async () => {
+    const sandboxDir = makeTempDir("omniroute-db-bad-path-");
+    const fileAsDir = path.join(sandboxDir, "not-a-directory");
+    fs.writeFileSync(fileAsDir, "blocked");
 
-  try {
-    // Since #4767, db/core.ts resolves a writable data dir at module load via
-    // resolveWritableDataDir() → mkdirSync(recursive). Pointing DATA_DIR at a
-    // regular file is a non-permission misconfiguration (EEXIST/ENOTDIR), which
-    // resolveWritableDataDir rethrows by design (only EACCES/EPERM fall back), so
-    // the failure now surfaces at import time, not lazily from getDbInstance().
-    let caught: unknown;
-    await withEnv({ DATA_DIR: fileAsDir }, () => importFresh("src/lib/db/core.ts")).then(
-      () => {
-        throw new Error("expected importing db/core with an invalid DATA_DIR to reject");
-      },
-      (err) => {
-        caught = err;
-      }
-    );
-    assert.ok(caught instanceof Error, "an invalid DATA_DIR must surface as a thrown Error");
-    assert.match(
-      String((caught as Error).message),
-      /unable to open database file|ENOTDIR|EEXIST|not a directory|file already exists/i
-    );
-  } finally {
-    removePath(sandboxDir);
+    try {
+      // Since #4767, db/core.ts resolves a writable data dir at module load via
+      // resolveWritableDataDir() → mkdirSync(recursive). Pointing DATA_DIR at a
+      // regular file is a non-permission misconfiguration (EEXIST/ENOTDIR), which
+      // resolveWritableDataDir rethrows by design (only EACCES/EPERM fall back), so
+      // the failure now surfaces at import time, not lazily from getDbInstance().
+      let caught: unknown;
+      await withEnv({ DATA_DIR: fileAsDir }, () => importFresh("src/lib/db/core.ts")).then(
+        () => {
+          throw new Error("expected importing db/core with an invalid DATA_DIR to reject");
+        },
+        (err) => {
+          caught = err;
+        }
+      );
+      assert.ok(caught instanceof Error, "an invalid DATA_DIR must surface as a thrown Error");
+      assert.match(
+        String((caught as Error).message),
+        /unable to open database file|ENOTDIR|EEXIST|not a directory|file already exists/i
+      );
+    } finally {
+      removePath(sandboxDir);
+    }
   }
-});
+);
 
 test(
   "legacy empty schema databases are renamed before a fresh sqlite database is created",
@@ -871,6 +875,116 @@ test(
       });
     } finally {
       removePath(dataDir);
+    }
+  }
+);
+
+test("legacy empty-provider detection preserves financial history", serial, async () => {
+  const dataDir = makeTempDir("omniroute-db-financial-legacy-");
+  const sqliteFile = path.join(dataDir, "storage.sqlite");
+  createLegacySchemaDb(sqliteFile);
+  const seed = new Database(sqliteFile);
+  seed.exec(fs.readFileSync("src/lib/db/migrations/170_prepaid_accounts.sql", "utf8"));
+  seed
+    .prepare("INSERT INTO prepaid_accounts VALUES (?, ?, ?, ?)")
+    .run("fixture", 1000, 0, new Date().toISOString());
+  seed.close();
+  try {
+    await withEnv({ DATA_DIR: dataDir }, async () => {
+      const core = await importFresh("src/lib/db/core.ts");
+      try {
+        assert.throws(
+          () => core.getDbInstance(),
+          /Financial state requires a complete database restore/
+        );
+        assert.equal(fs.existsSync(sqliteFile + ".old-schema"), false);
+        const preserved = new Database(sqliteFile, { readonly: true });
+        try {
+          assert.equal(
+            preserved.prepare("SELECT balance_nanos FROM prepaid_accounts").get().balance_nanos,
+            1000
+          );
+        } finally {
+          preserved.close();
+        }
+      } finally {
+        core.resetDbInstance();
+      }
+    });
+  } finally {
+    removePath(dataDir);
+  }
+});
+
+test(
+  "probe failure never selectively rebuilds a database holding financial state",
+  serial,
+  async () => {
+    for (const state of ["issuance", "prepaid"]) {
+      const dataDir = makeTempDir("omniroute-db-financial-recovery-");
+      const sqliteFile = path.join(dataDir, "storage.sqlite");
+      createRecoverableDb(sqliteFile);
+      const seed = new Database(sqliteFile);
+      seed.exec(fs.readFileSync("src/lib/db/migrations/169_api_key_issuances.sql", "utf8"));
+      seed.exec(fs.readFileSync("src/lib/db/migrations/170_prepaid_accounts.sql", "utf8"));
+      if (state === "issuance") {
+        seed
+          .prepare("INSERT INTO api_key_issuances VALUES (?, ?, ?, ?, ?)")
+          .run(
+            "fixture-issuance",
+            "fixture-request-hash",
+            "recover-key",
+            "fixture-key-hash",
+            new Date().toISOString()
+          );
+      } else {
+        seed
+          .prepare("INSERT INTO prepaid_accounts VALUES (?, ?, ?, ?)")
+          .run("recover-key", 1000, 500, new Date().toISOString());
+        seed
+          .prepare("INSERT INTO prepaid_reservations VALUES (?, ?, ?, ?, ?, ?, ?)")
+          .run(
+            "fixture-hold",
+            "recover-key",
+            500,
+            "dispatched",
+            null,
+            new Date().toISOString(),
+            new Date().toISOString()
+          );
+      }
+      seed.close();
+      const originalPrepare = Database.prototype.prepare;
+      try {
+        Database.prototype.prepare = function patchedPrepare(sql, ...args) {
+          if (String(sql).includes("schema_migrations")) throw new Error("forced probe failure");
+          return originalPrepare.call(this, sql, ...args);
+        };
+        await withEnv({ DATA_DIR: dataDir }, async () => {
+          const core = await importFresh("src/lib/db/core.ts");
+          try {
+            assert.throws(
+              () => core.getDbInstance(),
+              /Financial state requires a complete database restore/i
+            );
+            assert.equal(fs.existsSync(sqliteFile), true);
+            const backups = listProbeFailedBackups(sqliteFile);
+            assert.equal(backups.length, 0);
+            const preserved = new Database(sqliteFile, { readonly: true });
+            try {
+              const table = state === "issuance" ? "api_key_issuances" : "prepaid_reservations";
+              assert.equal(preserved.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n, 1);
+            } finally {
+              preserved.close();
+            }
+          } finally {
+            core.resetDbInstance();
+          }
+        });
+      } finally {
+        Database.prototype.prepare = originalPrepare;
+        removePath(dataDir);
+      }
     }
   }
 );

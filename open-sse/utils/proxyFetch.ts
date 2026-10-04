@@ -371,6 +371,7 @@ type PatchState = {
   originalFetch: typeof globalThis.fetch;
   proxyContext: AsyncLocalStorage<unknown>;
   tlsFingerprintContext?: AsyncLocalStorage<TlsFingerprintStore>;
+  singleDispatchContext?: AsyncLocalStorage<{ dispatched: boolean }>;
   isPatched: boolean;
 };
 
@@ -400,6 +401,12 @@ const originalFetch = patchState.originalFetch;
 const originalFetchWithDispatcher = originalFetch as FetchWithDispatcher;
 const proxyContext = patchState.proxyContext;
 const tlsFingerprintContext = patchState.tlsFingerprintContext;
+patchState.singleDispatchContext ??= new AsyncLocalStorage<{ dispatched: boolean }>();
+const singleDispatchContext = patchState.singleDispatchContext;
+
+export function runWithSingleDispatch<T>(fn: () => T): T {
+  return singleDispatchContext.run(singleDispatchContext.getStore() ?? { dispatched: false }, fn);
+}
 
 function noProxyMatch(targetUrl) {
   const noProxy = process.env.NO_PROXY || process.env.no_proxy;
@@ -730,6 +737,13 @@ async function patchedFetch(
   options: FetchWithDispatcherOptions = {},
   deps: ProxyFetchDeps = {}
 ) {
+  const singleDispatch = singleDispatchContext.getStore();
+  if (singleDispatch) {
+    if (singleDispatch.dispatched) throw new Error("A metered dispatch cannot be replayed");
+    singleDispatch.dispatched = true;
+    // Redirects can replay POST bodies inside fetch, outside the reservation boundary.
+    options = { ...options, redirect: "error" };
+  }
   // Explicit direct contexts must win even when a caller supplied a stale
   // dispatcher. Native fetch preserves direct streaming semantics.
   if (proxyContext.getStore() === DIRECT_PROXY_CONTEXT) {
@@ -762,6 +776,7 @@ async function patchedFetch(
     const tlsStore = tlsFingerprintContext.getStore();
     let tlsDirectFallback = false;
     if (
+      !singleDispatch &&
       isTlsFingerprintEnabled() &&
       activeTlsClient.available &&
       tlsFingerprintProviderAllowed(tlsStore?.provider, false) &&
@@ -812,7 +827,7 @@ async function patchedFetch(
     }
     // Direct undici path: bound response-start, fresh-socket retry, and body guard.
     const hasNonReplayableBody = requestHasNonReplayableBody(input, options);
-    const maxAttempts = hasNonReplayableBody ? 1 : 2;
+    const maxAttempts = hasNonReplayableBody || singleDispatch ? 1 : 2;
     const _undiciDirect =
       deps.undiciFetch ?? (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>);
     const _nativeFallback =
@@ -837,6 +852,7 @@ async function patchedFetch(
           directHeadersTimeoutMs
         );
       } catch (dispatcherError) {
+        if (singleDispatch) throw dispatcherError;
         if (isDirectResponseStartTimeout(dispatcherError)) {
           if (attempt === 0 && maxAttempts > 1) {
             console.warn(
@@ -981,7 +997,7 @@ async function patchedFetch(
     const _undiciRelay =
       deps.undiciFetch ?? (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>);
     const hasNonReplayableRelayBody = requestHasNonReplayableBody(input, options);
-    const maxRelayAttempts = hasNonReplayableRelayBody ? 1 : 2;
+    const maxRelayAttempts = hasNonReplayableRelayBody || singleDispatch ? 1 : 2;
     const relayUrl = `https://${vc.host}`;
     let lastRelayError: unknown = null;
     for (let attempt = 0; attempt < maxRelayAttempts; attempt++) {
@@ -1051,6 +1067,7 @@ async function patchedFetch(
   // http(s) proxy, no relay/family pinning, and only options wreq can preserve.
   const tlsStore = tlsFingerprintContext.getStore();
   if (
+    !singleDispatch &&
     isTlsFingerprintEnabled() &&
     typeof tlsStore?.sessionScope === "string" &&
     tlsStore.sessionScope.trim().length > 0 &&
@@ -1100,7 +1117,7 @@ async function patchedFetch(
   const _undiciProxy =
     deps.undiciFetch ?? (undiciFetch as unknown as (...args: unknown[]) => Promise<Response>);
   const hasNonReplayableProxyBody = requestHasNonReplayableBody(input, options);
-  const maxProxyAttempts = hasNonReplayableProxyBody ? 1 : 2;
+  const maxProxyAttempts = hasNonReplayableProxyBody || singleDispatch ? 1 : 2;
   let lastProxyError: unknown = null;
   for (let attempt = 0; attempt < maxProxyAttempts; attempt++) {
     try {

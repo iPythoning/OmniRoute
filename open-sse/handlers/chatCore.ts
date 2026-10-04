@@ -384,6 +384,12 @@ import { extractToolSchemaMap } from "../translator/response/openai-responses/to
 import { unwrapClineNonStreamingEnvelope } from "./chatCore/clineResponseEnvelope.ts";
 import { extractUsageFromResponse } from "./usageExtractor.ts";
 import {
+  assertPrepaidChatBody,
+  PrepaidInferenceError,
+  wrapPrepaidExecutor,
+} from "@/lib/prepaid/inference";
+import { getPrepaidBalance } from "@/lib/db/prepaid";
+import {
   sanitizeOpenAIResponse,
   sanitizeResponsesApiResponse,
   shouldParseTextualReasoningTags,
@@ -530,6 +536,19 @@ export async function handleChatCore({
   managedLease = null,
 }) {
   let { provider, model, extendedContext } = modelInfo;
+  let prepaidEnabled = false;
+  try {
+    prepaidEnabled = Boolean(apiKeyInfo?.id && getPrepaidBalance(apiKeyInfo.id));
+    // Check native tools before fallback conversion erases their hosted billing dimension.
+    if (prepaidEnabled) assertPrepaidChatBody(body);
+  } catch (error) {
+    return createErrorResult(
+      error instanceof PrepaidInferenceError ? error.status : 503,
+      error instanceof PrepaidInferenceError
+        ? error.message
+        : "Prepaid account temporarily unavailable"
+    );
+  }
   const resilienceSettings = resolveResilienceSettings(cachedSettings);
   if (!skipResourcePressureGuard) {
     try {
@@ -1251,9 +1270,11 @@ export async function handleChatCore({
   // Per-request opt-out: clients that manage their own context send
   // `x-omniroute-no-memory: true` to skip memory+skills injection (a null owner
   // disables both branches in injectMemoryAndSkills). See PRD-2026-06-19-no-memory-header.
-  const memoryOwnerId = isNoMemoryRequested(clientRawRequest?.headers ?? null)
-    ? null
-    : resolveMemoryOwnerId(apiKeyInfo as Record<string, unknown> | null);
+  // Memory retrieval/embedding and server skills do not yet share the prepaid meter.
+  const memoryOwnerId =
+    prepaidEnabled || isNoMemoryRequested(clientRawRequest?.headers ?? null)
+      ? null
+      : resolveMemoryOwnerId(apiKeyInfo as Record<string, unknown> | null);
   const injectionResult = await injectMemoryAndSkills({
     body,
     memoryOwnerId,
@@ -2844,7 +2865,8 @@ export async function handleChatCore({
     resolveExecutorWithProxyFor(
       prov,
       log,
-      (credentials?.providerSpecificData as Record<string, unknown> | null | undefined) ?? null
+      (credentials?.providerSpecificData as Record<string, unknown> | null | undefined) ?? null,
+      (executor) => wrapPrepaidExecutor(executor, apiKeyInfo?.id, prov)
     );
 
   // === Quota Share enforcement PRE-hook (B/F7) ===
@@ -4287,13 +4309,14 @@ export async function handleChatCore({
               let quotaCooldownMs = kimiRateLimitResetAt
                 ? Math.max(new Date(kimiRateLimitResetAt).getTime() - Date.now(), 0)
                 : retryAfterMs || COOLDOWN_MS.rateLimit;
-              const deferAntigravityQuotaStateToCaller =
-                shouldDeferAntigravityQuotaStateToCaller(
-                  provider,
-                  typeof onStreamFailure === "function"
-                );
-              const isAntigravityQuotaFamily =
-                shouldDeferAntigravityQuotaStateToCaller(provider, true);
+              const deferAntigravityQuotaStateToCaller = shouldDeferAntigravityQuotaStateToCaller(
+                provider,
+                typeof onStreamFailure === "function"
+              );
+              const isAntigravityQuotaFamily = shouldDeferAntigravityQuotaStateToCaller(
+                provider,
+                true
+              );
               let coreOwnedAntigravityLockout: {
                 cooldownMs: number;
                 failureCount: number;
