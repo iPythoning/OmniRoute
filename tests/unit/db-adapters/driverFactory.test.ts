@@ -7,7 +7,6 @@ import { createRequire } from "node:module";
 import type * as NodePath from "node:path";
 import { runtimeRequire } from "../../../src/lib/db/adapters/runtimeRequire.ts";
 
-
 const {
   createSyncDriverFactory,
   createBetterSqliteProbe,
@@ -36,7 +35,6 @@ function createTempDatabasePath(t: TestContext) {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return databasePath;
 }
-
 
 describe("driverFactory", () => {
   test("runtimeRequire loads Node built-ins outside webpack", () => {
@@ -557,7 +555,13 @@ describe("driverFactory", () => {
     const fs = fsNs.default;
 
     const tmpFile = path.join(os.tmpdir(), `sqljs_race_${Date.now()}.sqlite`);
-    fs.writeFileSync(tmpFile, Buffer.alloc(1024 * 1024, 1));
+    const seed = await openDatabaseAsync(":memory:");
+    try {
+      seed.exec("CREATE TABLE items (payload BLOB); INSERT INTO items VALUES (zeroblob(1048576))");
+      await seed.backup(tmpFile);
+    } finally {
+      seed.close();
+    }
     t.after(() => {
       try {
         fs.unlinkSync(tmpFile);
