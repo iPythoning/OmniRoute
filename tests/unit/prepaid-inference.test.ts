@@ -241,6 +241,167 @@ test("conflicting credentials cannot split authentication from prepaid metering"
   assert.equal((await policy.enforceApiKeyPolicy(single, null)).apiKeyInfo?.id, key.id);
 });
 
+test("search authentication and prepaid billing retain one identity through the request pipeline", async (t) => {
+  const { NextRequest } = await import("next/server");
+  const { runAuthzPipeline } = await import("../../src/server/authz/pipeline.ts");
+  const { AUTHZ_HEADER_AUTH_KIND } = await import("../../src/server/authz/headers.ts");
+  const flags = await import("../../src/lib/db/featureFlags.ts");
+  const providers = await import("../../src/lib/db/providers.ts");
+  const { getSearchProvider } = await import("../../open-sse/config/searchRegistry.ts");
+  const searchRoute = await import("../../src/app/api/v1/search/route.ts");
+  const config = getSearchProvider("linkup-search")!;
+  const price = ledger.formatUsdNanos(Math.round(config.costPerQuery * 1e9));
+  const previousFlag = flags.getFeatureFlagOverride("REQUIRE_API_KEY");
+  t.after(() => {
+    if (previousFlag === undefined) flags.removeFeatureFlagOverride("REQUIRE_API_KEY");
+    else flags.setFeatureFlagOverride("REQUIRE_API_KEY", previousFlag);
+  });
+  await providers.createProviderConnection({
+    provider: config.id,
+    authType: "apikey",
+    name: "billing identity fixture",
+    apiKey: randomUUID(),
+    isActive: true,
+    testStatus: "active",
+  });
+  const upstream = t.mock.method(globalThis, "fetch", async (input) => {
+    assert.equal(new URL(String(input)).origin, new URL(config.baseUrl).origin);
+    return Response.json({
+      results: [{ name: "Fixture", url: "https://example.test/result", content: "Result" }],
+    });
+  });
+  const request = (headers: HeadersInit) =>
+    new NextRequest("http://localhost/api/v1/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...Object.fromEntries(new Headers(headers)) },
+      body: JSON.stringify({ query: randomUUID(), provider: config.id, max_results: 1 }),
+    });
+  const forwardedRequest = (original: Request, decision: Response) => {
+    assert.equal(decision.headers.get("x-middleware-next"), "1");
+    const headers = new Headers();
+    for (const name of decision.headers.get("x-middleware-override-headers")!.split(",")) {
+      const value = decision.headers.get(`x-middleware-request-${name}`);
+      if (value !== null) headers.set(name, value);
+    }
+    return new Request(original, { headers });
+  };
+  const credential = (header: string, key: string) =>
+    header === "authorization" ? `Bearer ${key}` : key;
+  const headerNames = ["authorization", "x-api-key", "x-goog-api-key"];
+
+  for (const requireKey of ["true", "false"]) {
+    flags.setFeatureFlagOverride("REQUIRE_API_KEY", requireKey);
+    await t.test(
+      `conflicting headers are rejected before dispatch (require key=${requireKey})`,
+      async () => {
+        const key = await funded();
+        const other = await funded();
+        const before = upstream.mock.callCount();
+        for (const primary of headerNames) {
+          for (const secondary of headerNames.filter((header) => header !== primary)) {
+            for (const conflictingKey of [randomUUID(), other.key]) {
+              const headers = {
+                [primary]: credential(primary, key.key),
+                [secondary]: credential(secondary, conflictingKey),
+              };
+              const decision = await runAuthzPipeline(request(headers), { enforce: true });
+              assert.equal(decision.status, 400);
+              const response = await searchRoute.POST(request(headers));
+              assert.equal(response.status, 400);
+              const body = await response.text();
+              assert.ok(!body.includes(key.key) && !body.includes(conflictingKey));
+            }
+          }
+        }
+        assert.equal(upstream.mock.callCount(), before);
+        for (const id of [key.id, other.id]) {
+          assert.equal(ledger.getPrepaidBalance(id)?.balanceUsd, "1.000000000");
+          assert.equal(ledger.getPrepaidBalance(id)?.reservedUsd, "0.000000000");
+          assert.equal(
+            ledger.listPrepaidEntries(id, 10, 0).filter((entry) => entry.kind === "charge").length,
+            0
+          );
+        }
+      }
+    );
+
+    await t.test(
+      `accepted headers charge only the authenticated key (require key=${requireKey})`,
+      async () => {
+        const other = await funded();
+        for (const names of [...headerNames.map((name) => [name]), headerNames]) {
+          const key = await funded();
+          const before = upstream.mock.callCount();
+          const original = request({
+            ...Object.fromEntries(names.map((name) => [name, ` ${credential(name, key.key)} `])),
+            [AUTHZ_HEADER_AUTH_KIND]: "anonymous",
+          });
+          const decision = await runAuthzPipeline(original, { enforce: true });
+          const forwarded = forwardedRequest(original, decision);
+          assert.equal(forwarded.headers.get(AUTHZ_HEADER_AUTH_KIND), "client_api_key");
+          const response = await searchRoute.POST(forwarded);
+          assert.equal(response.status, 200);
+          assert.equal((await response.json()).cached, false);
+          assert.equal(upstream.mock.callCount(), before + 1);
+          assert.equal(
+            ledger.getPrepaidBalance(key.id)?.balanceUsd,
+            ledger.formatUsdNanos(ledger.parseUsdNanos("1") - ledger.parseUsdNanos(price))
+          );
+          assert.equal(ledger.getPrepaidBalance(key.id)?.reservedUsd, "0.000000000");
+          const charges = ledger
+            .listPrepaidEntries(key.id, 10, 0)
+            .filter((entry) => entry.kind === "charge");
+          assert.equal(charges.length, 1);
+          assert.equal(charges[0].amountUsd, price);
+          assert.equal(ledger.getPrepaidBalance(other.id)?.balanceUsd, "1.000000000");
+        }
+      }
+    );
+
+    await t.test(
+      `a key deleted after authentication cannot become an unbilled request (require key=${requireKey})`,
+      async () => {
+        const key = await funded();
+        const original = request({ "x-api-key": key.key });
+        const decision = await runAuthzPipeline(original, { enforce: true });
+        const forwarded = forwardedRequest(original, decision);
+        assert.equal(await keys.deleteApiKey(key.id), true);
+        const before = upstream.mock.callCount();
+        const response = await searchRoute.POST(forwarded);
+        const balance = ledger.getPrepaidBalance(key.id);
+        assert.deepEqual(
+          {
+            status: response.status,
+            upstreamCalls: upstream.mock.callCount() - before,
+            balanceUsd: balance?.balanceUsd,
+            reservedUsd: balance?.reservedUsd,
+          },
+          { status: 401, upstreamCalls: 0, balanceUsd: "1.000000000", reservedUsd: "0.000000000" }
+        );
+      }
+    );
+
+    await t.test(
+      `unknown-key handling respects the authentication mode (require key=${requireKey})`,
+      async () => {
+        const original = request({ "x-api-key": randomUUID() });
+        const decision = await runAuthzPipeline(original, { enforce: true });
+        const before = upstream.mock.callCount();
+        if (requireKey === "true") {
+          assert.equal(decision.status, 401);
+          assert.equal((await searchRoute.POST(original)).status, 401);
+          assert.equal(upstream.mock.callCount(), before);
+        } else {
+          const forwarded = forwardedRequest(original, decision);
+          assert.equal(forwarded.headers.get(AUTHZ_HEADER_AUTH_KIND), "anonymous");
+          assert.equal((await searchRoute.POST(forwarded)).status, 200);
+          assert.equal(upstream.mock.callCount(), before + 1);
+        }
+      }
+    );
+  }
+});
+
 test("prepaid transport failures keep one dispatch and one unresolved hold", async () => {
   const { proxyFetch } = await import("../../open-sse/utils/proxyFetch.ts");
   const { executePrepaidSearch } = await import("../../src/lib/prepaid/search.ts");

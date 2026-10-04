@@ -33,6 +33,8 @@ import { isQuotaModelName, parseQuotaModelName } from "@/lib/quota/quotaModelNam
 import { buildApiKeyUsageLimitPolicyRejection } from "@/lib/usage/apiKeyUsageLimits";
 import { ALL_COMBOS_ACCESS_RULE } from "@/shared/constants/comboAccess";
 import { prepaidRequestRejection } from "@/lib/prepaid/policy";
+import { AUTHZ_HEADER_AUTH_KIND } from "@/server/authz/headers";
+import { isRequireApiKeyEnabled } from "./featureFlags";
 
 // Default to no per-key request cap. API keys can still opt into explicit
 // limits via Settings/API Keys, while provider/account quota controls remain
@@ -680,8 +682,19 @@ export async function enforceApiKeyPolicy(
     };
   }
 
-  // Key not found in DB — skip policy (auth layer handles validation)
+  // A key can disappear after authentication. Never downgrade that request to
+  // anonymous/unmetered traffic; unknown keys are allowed only in local mode.
   if (!apiKeyInfo) {
+    if (
+      isRequireApiKeyEnabled() ||
+      request.headers.get(AUTHZ_HEADER_AUTH_KIND) === "client_api_key"
+    ) {
+      return {
+        apiKey,
+        apiKeyInfo: null,
+        rejection: errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key"),
+      };
+    }
     return { apiKey, apiKeyInfo: null, rejection: null };
   }
 
