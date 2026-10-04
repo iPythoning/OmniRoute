@@ -193,3 +193,80 @@ test("all materialized balances and holds reconcile to durable records", () => {
     .all();
   assert.deepEqual(rows, []);
 });
+
+test("live restore cannot acknowledge a financial write against the database being replaced", async () => {
+  const { restoreDbBackup } = await import("../../../src/lib/db/backup.ts");
+  const account = await funded("1");
+  const db = core.getDbInstance();
+  const backupId = `db_${randomUUID()}_manual.sqlite`;
+  fs.mkdirSync(core.DB_BACKUPS_DIR, { recursive: true });
+  await db.backup(path.join(core.DB_BACKUPS_DIR, backupId));
+  const restoring = restoreDbBackup(backupId);
+  try {
+    // Wait for the real native handle to close, leaving the restore's async replacement window.
+    for (let attempt = 0; attempt < 100 && db.open; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(db.open, false);
+    assert.throws(() => ledger.creditPrepaid(account, randomUUID(), "2"), { code: "unavailable" });
+  } finally {
+    await restoring;
+  }
+  assert.equal(ledger.getPrepaidBalance(account)?.balanceUsd, "1.000000000");
+  core.resetDbInstance();
+  assert.equal(ledger.getPrepaidBalance(account)?.balanceUsd, "1.000000000");
+});
+
+test("failed backup replacement recovers acknowledged credits and their idempotency receipts", async (t) => {
+  const { replaceDbFromBackup } = await import("../../../src/lib/db/backup.ts");
+  const account = await funded("1");
+  const candidate = path.join(dataDir, "failure-candidate.sqlite");
+  await core.getDbInstance().backup(candidate);
+  const creditId = randomUUID();
+  ledger.creditPrepaid(account, creditId, "2");
+  const rename = fs.renameSync;
+  let injected = false;
+  t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+    if (String(from).startsWith(`${core.SQLITE_FILE}.restore-`) && to === core.SQLITE_FILE) {
+      injected = true;
+      throw Object.assign(new Error("synthetic install failure"), { code: "ENOSPC" });
+    }
+    return rename(from, to);
+  });
+  await assert.rejects(replaceDbFromBackup(candidate), /synthetic install failure/);
+  assert.equal(injected, true);
+  core.resetDbInstance();
+  assert.equal(ledger.creditPrepaid(account, creditId, "2").balanceUsd, "3.000000000");
+});
+
+test("backup replacement retries a busy native file while keeping competing restores fenced", async (t) => {
+  const { replaceDbFromBackup } = await import("../../../src/lib/db/backup.ts");
+  const account = await funded("1");
+  const candidate = path.join(dataDir, "busy-candidate.sqlite");
+  await core.getDbInstance().backup(candidate);
+  const rename = fs.renameSync;
+  let attempts = 0;
+  t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+    if (from === core.SQLITE_FILE && ++attempts === 1)
+      throw Object.assign(new Error("synthetic busy handle"), { code: "EBUSY" });
+    return rename(from, to);
+  });
+  const restoring = replaceDbFromBackup(candidate);
+  await assert.rejects(replaceDbFromBackup(candidate), /maintenance/i);
+  await restoring;
+  assert.equal(attempts, 2);
+  assert.equal(ledger.getPrepaidBalance(account)?.balanceUsd, "1.000000000");
+});
+
+test("an interrupted restore marker prevents reopening or creating a financial database", async () => {
+  const account = await funded("1");
+  core.resetDbInstance();
+  fs.writeFileSync(core.DB_RESTORE_MARKER, JSON.stringify({ interrupted: true }));
+  try {
+    assert.throws(() => core.getDbInstance(), /maintenance/i);
+    assert.throws(() => ledger.creditPrepaid(account, randomUUID(), "2"), { code: "unavailable" });
+  } finally {
+    fs.unlinkSync(core.DB_RESTORE_MARKER);
+  }
+  assert.equal(ledger.getPrepaidBalance(account)?.balanceUsd, "1.000000000");
+});

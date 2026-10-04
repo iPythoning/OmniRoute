@@ -15,6 +15,7 @@ import {
 import path from "path";
 import { retryProbeIfTransient } from "./probeUtils";
 import fs from "fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { resolveWritableDataDir, getLegacyDotDataDir } from "../dataPaths";
 import { isNextBuildPhase } from "../buildPhase";
 import { runMigrations } from "./migrationRunner";
@@ -104,6 +105,7 @@ export const isBuildPhase = isNextBuildPhase();
 export const DATA_DIR = resolveWritableDataDir({ isCloud });
 const LEGACY_DATA_DIR = isCloud ? null : getLegacyDotDataDir();
 export const SQLITE_FILE = isCloud ? null : path.join(DATA_DIR, "storage.sqlite");
+export const DB_RESTORE_MARKER = SQLITE_FILE ? `${SQLITE_FILE}.restore-in-progress` : null;
 const JSON_DB_FILE = isCloud ? null : path.join(DATA_DIR, "db.json");
 export const DB_BACKUPS_DIR = isCloud ? null : path.join(DATA_DIR, "db_backups");
 const DEFAULT_CRITICAL_TABLE_ROW_LIMIT = 10_000;
@@ -516,6 +518,12 @@ const SCHEMA_SQL = `
 
 declare global {
   var __omnirouteDb: SqliteAdapter | undefined;
+  var __omnirouteDbMaintenance:
+    | {
+        owner: symbol | null;
+        context: AsyncLocalStorage<symbol>;
+      }
+    | undefined;
   // Cycle-breaker counter for the probe-failed/restore cascade. Survives
   // Next.js HMR re-evaluations so concurrent subsystems all see the same
   // count and we abort with a clear error instead of looping forever.
@@ -532,6 +540,27 @@ declare global {
 
 function getDb(): SqliteDatabase | null {
   return globalThis.__omnirouteDb ?? null;
+}
+
+export async function withDbMaintenance<T>(operation: () => Promise<T>): Promise<T> {
+  const state = (globalThis.__omnirouteDbMaintenance ??= {
+    owner: null,
+    context: new AsyncLocalStorage<symbol>(),
+  });
+  if (state.owner || (DB_RESTORE_MARKER && fs.existsSync(DB_RESTORE_MARKER)))
+    throw new Error("Database maintenance is in progress");
+  const owner = Symbol("database-maintenance");
+  state.owner = owner;
+  return state.context.run(owner, async () => {
+    try {
+      // Invalidate handles obtained before the fence, including callers paused at an await.
+      resetDbInstance();
+      return await operation();
+    } finally {
+      // A failed replacement without a usable restored handle stays fenced until restart.
+      if (getDb()?.open) state.owner = null;
+    }
+  });
 }
 
 function setDb(db: SqliteDatabase | null): void {
@@ -1035,6 +1064,13 @@ export function runManagedDbHealthCheck(options?: { autoRepair?: boolean }) {
 }
 
 export function getDbInstance(): SqliteDatabase {
+  const maintenance = globalThis.__omnirouteDbMaintenance;
+  if (
+    (maintenance?.owner && maintenance.context.getStore() !== maintenance.owner) ||
+    (!maintenance?.owner && DB_RESTORE_MARKER && fs.existsSync(DB_RESTORE_MARKER))
+  ) {
+    throw new Error("Database maintenance is in progress");
+  }
   const existing = getDb();
   if (existing) return existing;
 

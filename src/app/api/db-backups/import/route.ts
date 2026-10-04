@@ -2,15 +2,9 @@ import { NextResponse } from "next/server";
 import path from "path";
 import fs from "fs";
 import os from "os";
-import { getDbInstance, resetDbInstance, SQLITE_FILE } from "@/lib/db/core";
 import { openDatabaseAsync } from "@/lib/db/adapters/driverFactory";
 import type { SqliteAdapter } from "@/lib/db/adapters/types";
-import {
-  backupDbFile,
-  getTableNamesFromAdapter,
-  countImportedRows,
-  unlinkFileWithRetry,
-} from "@/lib/db/backup";
+import { getTableNamesFromAdapter, countImportedRows, replaceDbFromBackup } from "@/lib/db/backup";
 import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
 import { getSettings } from "@/lib/db/settings";
 import { setSystemPromptConfig } from "@omniroute/open-sse/services/systemPrompt.ts";
@@ -29,9 +23,7 @@ const MAX_UPLOAD_MB_CEILING = 4096;
  * via `OMNIROUTE_DB_IMPORT_MAX_MB`. Invalid / out-of-range values fall back to the 100 MB
  * default and are clamped to a 4 GB ceiling.
  */
-export function resolveMaxUploadSizeBytes(
-  env: NodeJS.ProcessEnv = process.env
-): number {
+export function resolveMaxUploadSizeBytes(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.OMNIROUTE_DB_IMPORT_MAX_MB;
   const parsed = raw === undefined ? NaN : Number(raw);
   const mb =
@@ -159,32 +151,7 @@ export async function POST(request: Request) {
       );
     }
 
-    // Create pre-import backup
-    backupDbFile("pre-import");
-
-    // Close and reset current DB connection
-    resetDbInstance();
-
-    // Remove main file and WAL sidecars
-    const sqliteFilesToReplace = [
-      SQLITE_FILE,
-      `${SQLITE_FILE}-wal`,
-      `${SQLITE_FILE}-shm`,
-      `${SQLITE_FILE}-journal`,
-    ];
-    // Delete with EBUSY/EPERM retry: after resetDbInstance() the OS may still
-    // hold the SQLite file handle for a moment (Windows mmap / antivirus), so a
-    // plain unlink races to EBUSY (#5406). Mirror the restore path's helper.
-    for (const filePath of sqliteFilesToReplace) {
-      if (!filePath) continue;
-      await unlinkFileWithRetry(filePath);
-    }
-
-    // Copy imported file over current DB
-    fs.copyFileSync(tmpPath, SQLITE_FILE!);
-
-    // Reopen and verify
-    getDbInstance();
+    await replaceDbFromBackup(tmpPath);
     const { connCount, nodeCount, comboCount, keyCount } = countImportedRows();
 
     console.log(

@@ -4,16 +4,18 @@
 
 import path from "path";
 import fs from "fs";
+import { randomUUID } from "node:crypto";
 import {
   getDbInstance,
   resetDbInstance,
+  withDbMaintenance,
   isBuildPhase,
   isCloud,
   SQLITE_FILE,
   DB_BACKUPS_DIR,
+  DB_RESTORE_MARKER,
   DATA_DIR,
 } from "./core";
-import { resetAllDbModuleState } from "./stateReset";
 import {
   MAX_DB_BACKUPS,
   DEFAULT_DB_BACKUP_RETENTION_DAYS,
@@ -220,18 +222,26 @@ export async function unlinkFileWithRetry(
   filePath: string,
   options?: { maxAttempts?: number; retryableCodes?: string[]; baseDelayMs?: number }
 ) {
+  return retryFileOperation(() => {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  }, options);
+}
+
+async function retryFileOperation(
+  operation: () => void,
+  options?: { maxAttempts?: number; retryableCodes?: string[]; baseDelayMs?: number }
+) {
   const maxAttempts = Math.max(1, options?.maxAttempts ?? 10);
   const retryableCodes = new Set(options?.retryableCodes ?? ["EBUSY", "EPERM"]);
   const baseDelayMs = Math.max(0, options?.baseDelayMs ?? 100);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      operation();
       return;
     } catch (err: unknown) {
       const code =
         err && typeof err === "object" && "code" in err ? (err as NodeJS.ErrnoException).code : "";
-      if (code === "ENOENT") return;
       if (retryableCodes.has(String(code)) && attempt < maxAttempts - 1) {
         await sleep(baseDelayMs * (attempt + 1));
       } else {
@@ -239,6 +249,92 @@ export async function unlinkFileWithRetry(
       }
     }
   }
+}
+
+function syncRestoreDirectory(directory: string) {
+  // Windows does not expose directory handles through fs.openSync.
+  if (process.platform === "win32") return;
+  const fd = fs.openSync(directory, "r");
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+export async function replaceDbFromBackup(sourcePath: string) {
+  return withDbMaintenance(async () => {
+    const sqliteFile = SQLITE_FILE;
+    if (!sqliteFile || !DB_RESTORE_MARKER)
+      throw new Error("SQLITE_FILE is unavailable in local backup restore");
+    const backupDir = getBackupDir();
+    fs.mkdirSync(backupDir, { recursive: true });
+    const rollbackPath = path.join(
+      backupDir,
+      `db_${new Date().toISOString().replace(/[:.]/g, "-")}_${randomUUID()}-pre-restore.sqlite`
+    );
+    const stagedPath = `${sqliteFile}.restore-${randomUUID()}`;
+    const suffixes = ["", "-wal", "-shm", "-journal"];
+    const moved: string[] = [];
+    let installed = false;
+    let markerCreated = false;
+    let ready = false;
+    try {
+      // Finish copying and syncing the candidate before touching any live database files.
+      fs.copyFileSync(sourcePath, stagedPath, fs.constants.COPYFILE_EXCL);
+      const fd = fs.openSync(stagedPath, "r");
+      try {
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      const markerFd = fs.openSync(DB_RESTORE_MARKER, "wx", 0o600);
+      markerCreated = true;
+      try {
+        fs.writeFileSync(markerFd, JSON.stringify({ sourcePath, rollbackPath, stagedPath }));
+        fs.fsyncSync(markerFd);
+      } finally {
+        fs.closeSync(markerFd);
+      }
+      syncRestoreDirectory(path.dirname(sqliteFile));
+      // Windows may release the closed native handle asynchronously.
+      await sleep(500);
+      for (const suffix of suffixes) {
+        if (!fs.existsSync(`${sqliteFile}${suffix}`)) continue;
+        await retryFileOperation(() =>
+          fs.renameSync(`${sqliteFile}${suffix}`, `${rollbackPath}${suffix}`)
+        );
+        moved.push(suffix);
+      }
+      fs.renameSync(stagedPath, sqliteFile);
+      installed = true;
+      const db = getDbInstance();
+      ready = true;
+      return db;
+    } catch (error) {
+      if (installed) {
+        resetDbInstance();
+        for (const suffix of suffixes) await unlinkFileWithRetry(`${sqliteFile}${suffix}`);
+      }
+      for (const suffix of moved) {
+        await retryFileOperation(() =>
+          fs.renameSync(`${rollbackPath}${suffix}`, `${sqliteFile}${suffix}`)
+        );
+      }
+      // Only reopening the original database allows withDbMaintenance to lift its fence.
+      getDbInstance();
+      ready = true;
+      throw error;
+    } finally {
+      if (markerCreated && ready) {
+        syncRestoreDirectory(backupDir);
+        syncRestoreDirectory(path.dirname(sqliteFile));
+        fs.unlinkSync(DB_RESTORE_MARKER);
+        syncRestoreDirectory(path.dirname(sqliteFile));
+      }
+      if (fs.existsSync(stagedPath)) fs.unlinkSync(stagedPath);
+    }
+  });
 }
 
 // ──────────────── Backup ────────────────
@@ -410,57 +506,7 @@ export async function restoreDbBackup(backupId: string) {
     throw new Error(`Backup file is corrupt: ${message}`);
   }
 
-  // Force pre-restore backup (bypass throttle) and await so the DB is not closed while backup runs
-  if (!isSqliteAutoBackupDisabled()) {
-    _lastBackupAt = 0;
-    const backupDirForPre = getBackupDir();
-    if (SQLITE_FILE && fs.existsSync(SQLITE_FILE)) {
-      const stat = fs.statSync(SQLITE_FILE);
-      if (stat.size >= 4096) {
-        if (!fs.existsSync(backupDirForPre)) fs.mkdirSync(backupDirForPre, { recursive: true });
-        const preBackupPath = path.join(
-          backupDirForPre,
-          `db_${new Date().toISOString().replace(/[:.]/g, "-")}_pre-restore.sqlite`
-        );
-        const dbForBackup = getDbInstance();
-        await dbForBackup.backup(preBackupPath);
-        _lastBackupAt = Date.now();
-      }
-    }
-  }
-
-  // Close and reset current connection
-  resetDbInstance();
-
-  // Clear all cached prepared statements and other state bound to the old connection
-  resetAllDbModuleState();
-
-  const sqliteFile = SQLITE_FILE;
-  if (!sqliteFile) {
-    throw new Error("SQLITE_FILE is unavailable in local backup restore");
-  }
-
-  // On Windows, the file handle may be released asynchronously after close; give it a moment.
-  await sleep(500);
-
-  // Remove main file and WAL sidecars to avoid stale frame replay after restore.
-  // Retry unlink on EBUSY/EPERM (Windows may hold the handle briefly).
-  const sqliteFilesToReplace = [
-    sqliteFile,
-    `${sqliteFile}-wal`,
-    `${sqliteFile}-shm`,
-    `${sqliteFile}-journal`,
-  ];
-  for (const filePath of sqliteFilesToReplace) {
-    if (!filePath) continue;
-    await unlinkFileWithRetry(filePath);
-  }
-
-  // Copy backup over current DB
-  fs.copyFileSync(backupPath, sqliteFile);
-
-  // Reopen
-  const db = getDbInstance();
+  const db = await replaceDbFromBackup(backupPath);
   const connCount =
     (db.prepare("SELECT COUNT(*) as cnt FROM provider_connections").get() as CountRow | undefined)
       ?.cnt || 0;
