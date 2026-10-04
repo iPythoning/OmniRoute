@@ -353,6 +353,7 @@ test("search authentication and prepaid billing retain one identity through the 
             .filter((entry) => entry.kind === "charge");
           assert.equal(charges.length, 1);
           assert.equal(charges[0].amountUsd, price);
+          assert.equal(response.headers.get("x-omniroute-billing-id"), charges[0].id);
           assert.equal(ledger.getPrepaidBalance(other.id)?.balanceUsd, "1.000000000");
         }
       }
@@ -563,10 +564,12 @@ test("unresolved holds are visible and evidence-backed reconciliation is idempot
 
 test("real chatCore JSON and SSE paths commit the prepaid ledger through the executor boundary", async () => {
   const { handleChatCore } = await import("../../open-sse/handlers/chatCore.ts");
+  const { withEarlyStreamKeepalive } = await import("../../open-sse/utils/earlyStreamKeepalive.ts");
   const originalFetch = globalThis.fetch;
   await settings.updateSettings({ memoryEnabled: true, skillsEnabled: true, memoryMaxTokens: 0 });
   try {
-    for (const stream of [false, true]) {
+    for (const mode of ["json", "sse", "delayed-sse"]) {
+      const stream = mode !== "json";
       const key = await funded();
       let providerCalls = 0;
       globalThis.fetch = async (_url, init) => {
@@ -611,10 +614,28 @@ test("real chatCore JSON and SSE paths commit the prepaid ledger through the exe
       });
       assert.ok(!(result instanceof Response));
       assert.equal(result.response.status, 200);
-      assert.match(await result.response.text(), /answer/);
+      let response = result.response;
+      if (mode === "delayed-sse") {
+        let release!: (response: Response) => void;
+        const deferred = new Promise<Response>((resolve) => {
+          release = resolve;
+        });
+        response = await withEarlyStreamKeepalive(deferred, { thresholdMs: 0 });
+        release(result.response);
+      }
+      const text = await response.text();
+      assert.match(text, /answer/);
       assert.equal(providerCalls, 1);
       assert.equal(ledger.getPrepaidBalance(key.id)?.balanceUsd, "0.999800000");
       assert.equal(ledger.getPrepaidBalance(key.id)?.reservedUsd, "0.000000000");
+      const billingId = result.response.headers.get("x-omniroute-billing-id");
+      assert.ok(billingId, "final responses expose the settled attempt ID");
+      assert.equal(
+        ledger.listPrepaidEntries(key.id, 10, 0).find((entry) => entry.kind === "charge")?.id,
+        billingId
+      );
+      if (mode === "delayed-sse")
+        assert.ok(text.includes(`: X-OmniRoute-Billing-Id: ${billingId}\n\n`));
     }
   } finally {
     globalThis.fetch = originalFetch;

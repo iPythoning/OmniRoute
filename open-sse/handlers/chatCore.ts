@@ -5359,6 +5359,11 @@ export async function handleChatCore({
       compressionResponseMeta,
       comboStrategy,
     });
+    if (prepaidEnabled && providerResponse.headers.has(OMNIROUTE_RESPONSE_HEADERS.billingId)) {
+      responseHeaders[OMNIROUTE_RESPONSE_HEADERS.billingId] = providerResponse.headers.get(
+        OMNIROUTE_RESPONSE_HEADERS.billingId
+      );
+    }
     // #6426: align response body `model` with the `X-OmniRoute-Model` header
     // (both must be the resolved backend model). Some upstreams (notably legacy
     // /v1/completions text-completion path) return a body `model` field that
@@ -5508,6 +5513,11 @@ export async function handleChatCore({
     compressionResponseMeta,
     comboStrategy,
   });
+  if (prepaidEnabled && providerResponse.headers.has(OMNIROUTE_RESPONSE_HEADERS.billingId)) {
+    responseHeaders[OMNIROUTE_RESPONSE_HEADERS.billingId] = providerResponse.headers.get(
+      OMNIROUTE_RESPONSE_HEADERS.billingId
+    );
+  }
 
   // The streaming headers (turn-state included, when present) are committed to
   // the client from here on — record which connection minted the blob so a

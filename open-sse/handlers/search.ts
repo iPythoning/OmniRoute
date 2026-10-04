@@ -117,6 +117,7 @@ interface SearchHandlerOptions {
   /** Connection ID (proxy resolution + call-log attribution) and API key ID (per-key proxy). */
   connectionId?: string;
   apiKeyId?: string;
+  onBillingReservation?: (id: string) => void;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -1455,6 +1456,7 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
     log,
     connectionId,
     apiKeyId,
+    onBillingReservation,
   } = options;
   const startTime = Date.now();
 
@@ -1547,7 +1549,8 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
         startTime,
         log,
         alternateCredentials?.connectionId,
-        apiKeyId
+        apiKeyId,
+        onBillingReservation
       );
     }
     return {
@@ -1565,7 +1568,8 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
     startTime,
     log,
     connectionId,
-    apiKeyId
+    apiKeyId,
+    onBillingReservation
   );
 
   if (result.success) return result;
@@ -1592,7 +1596,8 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
       startTime,
       log,
       alternateCredentials?.connectionId,
-      apiKeyId
+      apiKeyId,
+      onBillingReservation
     );
 
     if (fallbackResult.success) return fallbackResult;
@@ -1701,9 +1706,15 @@ async function tryDuckDuckGoFreeProvider(
 }
 
 async function tryProvider(
-  ...args: Parameters<typeof tryProviderUnmetered>
+  ...args: [...Parameters<typeof tryProviderUnmetered>, onReservation?: (id: string) => void]
 ): Promise<SearchHandlerResult> {
-  return executePrepaidSearch(args[6], args[0], () => tryProviderUnmetered(...args));
+  const [config, params, credentials, startTime, log, connectionId, apiKeyId, onReservation] = args;
+  return executePrepaidSearch(
+    apiKeyId,
+    config,
+    () => tryProviderUnmetered(config, params, credentials, startTime, log, connectionId, apiKeyId),
+    onReservation
+  );
 }
 
 async function tryProviderUnmetered(

@@ -32,6 +32,7 @@
  */
 
 import { recordEarlyKeepaliveBytes } from "./earlyKeepaliveByteBuffer.ts";
+import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
 
 const ENCODER = new TextEncoder();
 const KEEPALIVE_FRAME = ENCODER.encode(": keepalive\n\n");
@@ -291,6 +292,16 @@ export async function withEarlyStreamKeepalive(
           const isSse = contentType.includes("text/event-stream");
 
           if (response.body && isSse) {
+            // Headers were already committed by the keepalive. Preserve the locally
+            // minted receipt as an SSE comment without adding a protocol data event.
+            const billingId = response.headers.get(OMNIROUTE_RESPONSE_HEADERS.billingId);
+            if (billingId) {
+              const receipt = ENCODER.encode(
+                `: ${OMNIROUTE_RESPONSE_HEADERS.billingId}: ${billingId}\n\n`
+              );
+              controller.enqueue(receipt);
+              recordClientBytes(receipt);
+            }
             // Real SSE stream — forward it verbatim.
             upstreamReader = response.body.getReader();
             let bytesForwarded = 0;

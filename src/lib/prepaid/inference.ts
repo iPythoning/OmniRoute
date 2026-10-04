@@ -24,6 +24,7 @@ import { DarioExecutor } from "@omniroute/open-sse/executors/dario";
 import { normalizeExecutorResult } from "@omniroute/open-sse/handlers/chatCore/upstreamTimeouts";
 import { runWithSingleDispatch } from "@omniroute/open-sse/utils/proxyFetch";
 import { containsMediaKind } from "@omniroute/open-sse/utils/mediaParts";
+import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
 
 type Usage = Record<string, number | undefined>;
 type BillingQuote = {
@@ -359,7 +360,7 @@ function meterResponse(response: Response, id: string, billing: BillingQuote): R
     })
   );
   const headers = new Headers(response.headers);
-  headers.set("x-omniroute-billing-id", id);
+  headers.set(OMNIROUTE_RESPONSE_HEADERS.billingId, id);
   return new Response(stream, {
     status: response.status,
     statusText: response.statusText,

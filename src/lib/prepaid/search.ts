@@ -14,7 +14,8 @@ type SearchResult = { success: boolean; status?: number; error?: string };
 export async function executePrepaidSearch<T extends SearchResult>(
   apiKeyId: string | undefined,
   config: { id: string; costPerQuery: number },
-  execute: () => Promise<T>
+  execute: () => Promise<T>,
+  onReservation?: (id: string) => void
 ): Promise<T | SearchResult> {
   try {
     if (!apiKeyId || !getPrepaidBalance(apiKeyId)) return await execute();
@@ -29,6 +30,7 @@ export async function executePrepaidSearch<T extends SearchResult>(
     const amount = formatUsdNanos(nanos);
     const id = randomUUID();
     reservePrepaid(apiKeyId, id, amount, { provider: config.id, queryPriceUsd: amount });
+    onReservation?.(id);
     dispatchPrepaid(id);
     const result = await runWithSingleDispatch(execute);
     if (result.success) settlePrepaid(id, amount);
