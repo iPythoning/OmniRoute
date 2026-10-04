@@ -780,6 +780,110 @@ test("prepaid requests reject input audio before an enabled bridge can dispatch 
   }
 });
 
+test("prepaid MCP search completes SDK setup and dispatches exactly one billable tool call", async () => {
+  const { handleSearch } = await import("../../open-sse/handlers/search.ts");
+  const { proxyFetch } = await import("../../open-sse/utils/proxyFetch.ts");
+  const originalFetch = globalThis.fetch;
+  const key = await funded();
+  const methods: string[] = [];
+  const upstream: typeof fetch = async (_url, init = {}) => {
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+    methods.push(body.method ?? init.method ?? "GET");
+    if (body.method === "initialize")
+      return Response.json(
+        {
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            serverInfo: { name: "fixture", version: "1" },
+          },
+        },
+        { headers: { "mcp-session-id": "prepaid-fixture" } }
+      );
+    if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+    if (body.method === "tools/call")
+      return Response.json({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify([
+                { title: "fixture", link: "https://example.test", content: "answer" },
+              ]),
+            },
+          ],
+        },
+      });
+    return new Response(null, { status: 405 });
+  };
+  globalThis.fetch = (url, init) =>
+    proxyFetch(url, init, { nativeFetch: upstream, undiciFetch: upstream });
+  try {
+    const result = await handleSearch({
+      query: "prepaid SDK fixture",
+      provider: "zai-search",
+      maxResults: 1,
+      searchType: "web",
+      credentials: { apiKey: randomUUID() },
+      apiKeyId: key.id,
+    });
+    assert.equal(result.success, true, result.error);
+    assert.ok(methods.includes("initialize"));
+    assert.ok(methods.includes("notifications/initialized"));
+    assert.equal(methods.filter((method) => method === "tools/call").length, 1);
+    assert.equal(
+      ledger.listPrepaidEntries(key.id, 10, 0).filter((entry) => entry.kind === "charge").length,
+      1
+    );
+    assert.equal(ledger.listPrepaidReservations(key.id, 10, 0).length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("MCP setup exemption cannot replay a tool call or disable the parent dispatch fence", async () => {
+  const { proxyFetch, runWithSingleDispatch } = await import("../../open-sse/utils/proxyFetch.ts");
+  for (const fail of [false, true]) {
+    let calls = 0;
+    const upstream: typeof fetch = async () => {
+      calls++;
+      if (fail) throw new Error("synthetic network failure");
+      return Response.json({});
+    };
+    const request = (method: string) =>
+      proxyFetch(
+        "https://example.test/mcp",
+        {
+          method: "POST",
+          body: JSON.stringify({ jsonrpc: "2.0", method, id: 1 }),
+        },
+        { undiciFetch: upstream, nativeFetch: upstream }
+      );
+    await runWithSingleDispatch(
+      async () => {
+        if (fail) await assert.rejects(request("tools/call"), /synthetic network failure/);
+        else await request("tools/call");
+        await assert.rejects(request("tools/call"), /cannot be replayed/);
+      },
+      { protocol: "mcp" }
+    );
+    assert.equal(calls, 1);
+    await runWithSingleDispatch(async () => {
+      if (fail) await assert.rejects(request("initialize"));
+      else await request("initialize");
+      await assert.rejects(
+        runWithSingleDispatch(() => request("notifications/initialized"), { protocol: "mcp" }),
+        /cannot be replayed/
+      );
+    });
+    assert.equal(calls, 2);
+  }
+});
+
 test("Responses and Claude SSE usage follows terminal snapshots without losing cached input", async () => {
   for (const events of [
     [

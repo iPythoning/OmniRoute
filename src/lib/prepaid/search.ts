@@ -13,7 +13,7 @@ type SearchResult = { success: boolean; status?: number; error?: string };
 
 export async function executePrepaidSearch<T extends SearchResult>(
   apiKeyId: string | undefined,
-  config: { id: string; costPerQuery: number },
+  config: { id: string; costPerQuery: number; transport?: "mcp" },
   execute: () => Promise<T>,
   onReservation?: (id: string) => void
 ): Promise<T | SearchResult> {
@@ -32,7 +32,7 @@ export async function executePrepaidSearch<T extends SearchResult>(
     reservePrepaid(apiKeyId, id, amount, { provider: config.id, queryPriceUsd: amount });
     onReservation?.(id);
     dispatchPrepaid(id);
-    const result = await runWithSingleDispatch(execute);
+    const result = await runWithSingleDispatch(execute, { protocol: config.transport });
     if (result.success) settlePrepaid(id, amount);
     // Error outcomes remain reserved: a provider may have processed a request before returning an error.
     return result;

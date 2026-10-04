@@ -367,11 +367,13 @@ export type ProxyFetchDeps = {
   findWorkingProxy?: (hostname: string, targetUrl: string) => Promise<string | null>;
 };
 
+type SingleDispatchState = { dispatched: boolean; protocol?: "mcp" };
+
 type PatchState = {
   originalFetch: typeof globalThis.fetch;
   proxyContext: AsyncLocalStorage<unknown>;
   tlsFingerprintContext?: AsyncLocalStorage<TlsFingerprintStore>;
-  singleDispatchContext?: AsyncLocalStorage<{ dispatched: boolean }>;
+  singleDispatchContext?: AsyncLocalStorage<SingleDispatchState>;
   isPatched: boolean;
 };
 
@@ -401,11 +403,33 @@ const originalFetch = patchState.originalFetch;
 const originalFetchWithDispatcher = originalFetch as FetchWithDispatcher;
 const proxyContext = patchState.proxyContext;
 const tlsFingerprintContext = patchState.tlsFingerprintContext;
-patchState.singleDispatchContext ??= new AsyncLocalStorage<{ dispatched: boolean }>();
+patchState.singleDispatchContext ??= new AsyncLocalStorage<SingleDispatchState>();
 const singleDispatchContext = patchState.singleDispatchContext;
 
-export function runWithSingleDispatch<T>(fn: () => T): T {
-  return singleDispatchContext.run(singleDispatchContext.getStore() ?? { dispatched: false }, fn);
+export function runWithSingleDispatch<T>(fn: () => T, options?: { protocol?: "mcp" }): T {
+  return singleDispatchContext.run(
+    singleDispatchContext.getStore() ?? { dispatched: false, protocol: options?.protocol },
+    fn
+  );
+}
+
+function isMcpControlRequest(input: RequestInfo | URL, options: RequestInit): boolean {
+  const method = (
+    options.method ?? (input instanceof Request ? input.method : "GET")
+  ).toUpperCase();
+  if (method === "GET" || method === "DELETE") return true;
+  if (method !== "POST" || typeof options.body !== "string") return false;
+  try {
+    const message = JSON.parse(options.body);
+    return (
+      message?.jsonrpc === "2.0" &&
+      ["initialize", "notifications/initialized", "notifications/cancelled", "ping"].includes(
+        message.method
+      )
+    );
+  } catch {
+    return false;
+  }
 }
 
 function noProxyMatch(targetUrl) {
@@ -739,8 +763,10 @@ async function patchedFetch(
 ) {
   const singleDispatch = singleDispatchContext.getStore();
   if (singleDispatch) {
-    if (singleDispatch.dispatched) throw new Error("A metered dispatch cannot be replayed");
-    singleDispatch.dispatched = true;
+    if (singleDispatch.protocol !== "mcp" || !isMcpControlRequest(input, options)) {
+      if (singleDispatch.dispatched) throw new Error("A metered dispatch cannot be replayed");
+      singleDispatch.dispatched = true;
+    }
     // Redirects can replay POST bodies inside fetch, outside the reservation boundary.
     options = { ...options, redirect: "error" };
   }
