@@ -46,40 +46,48 @@ test("bun:sqlite adapter supports CRUD, pragmas, transactions, and close", async
 });
 
 test("bun:sqlite adapter backs up on-disk databases without serializing them", async (t) => {
-  const sourcePath = path.join(os.tmpdir(), `bun-sqlite-source-${Date.now()}.sqlite`);
-  const destinationPath = path.join(os.tmpdir(), `bun-sqlite-destination-${Date.now()}.sqlite`);
-  const sourceContents = "sqlite fixture";
-  const execCalls: string[] = [];
-  fs.writeFileSync(sourcePath, sourceContents);
+  const DatabaseSync = process.versions.bun
+    ? (await import("bun:sqlite")).Database
+    : (await import("node:sqlite")).DatabaseSync;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wal-backup-"));
+  const sourcePath = path.join(dir, "source.sqlite");
+  const destinationPath = path.join(dir, "backup.sqlite");
+  const db = new DatabaseSync(sourcePath);
+  const reader = new DatabaseSync(sourcePath);
   t.after(() => {
-    for (const filePath of [sourcePath, destinationPath]) {
-      try {
-        fs.unlinkSync(filePath);
-      } catch {}
-    }
+    reader.close();
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   });
-
-  const db = {
-    query() {
-      throw new Error("query should not be called during backup");
-    },
-    exec(sql: string) {
-      execCalls.push(sql);
-    },
-    transaction() {
-      throw new Error("transaction should not be called during backup");
-    },
-    close() {},
-    serialize() {
-      throw new Error("serialize must not be called for an on-disk backup");
-    },
-  } as unknown as BunSqliteDatabaseLike;
-
-  const adapter = createBunSqliteAdapter(db, sourcePath);
+  db.exec(
+    "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1; CREATE TABLE reservation(state TEXT); INSERT INTO reservation VALUES ('held'); PRAGMA wal_checkpoint(TRUNCATE)"
+  );
+  reader.exec("BEGIN");
+  reader.prepare("SELECT * FROM reservation").get();
+  db.exec("UPDATE reservation SET state = 'dispatched'");
+  assert.equal(db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get()?.busy, 1);
+  const adapter = createBunSqliteAdapter(
+    {
+      query: (sql) => db.prepare(sql),
+      exec: (sql) => db.exec(sql),
+      close: () => {},
+      transaction: () => {
+        throw new Error("unused");
+      },
+      serialize: () => {
+        throw new Error("must not serialize whole DB into memory");
+      },
+    } as BunSqliteDatabaseLike,
+    sourcePath
+  );
   await adapter.backup(destinationPath);
-
-  assert.deepEqual(execCalls, ["PRAGMA wal_checkpoint(TRUNCATE)"]);
-  assert.equal(fs.readFileSync(destinationPath, "utf8"), sourceContents);
+  const restored = new DatabaseSync(destinationPath);
+  try {
+    assert.equal(restored.prepare("SELECT state FROM reservation").get()?.state, "dispatched");
+  } finally {
+    restored.close();
+    reader.exec("ROLLBACK");
+  }
 });
 
 test("loadSqliteRuntime prioritizes bun:sqlite under Bun without loading better-sqlite3", async (t) => {

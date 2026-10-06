@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "release/**"]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
@@ -784,6 +784,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
@@ -799,14 +800,11 @@ jobs:
         env:
           TEST_SHARD: ${{ matrix.shard }}/8
         run: |
-          rm -rf coverage-shard coverage-shard-report
-          npx c8 \
-            --temp-directory=coverage-shard \
-            --reports-dir=coverage-shard-report \
-            --reporter=json \
-            --exclude=tests/** \
-            --exclude=**/*.test.* \
-            npm run test:unit:ci:shard
+          rm -rf coverage-shard
+          mkdir -p coverage-shard
+          # Capture raw V8 data once; the Coverage job performs the incremental
+          # merge and the unchanged 60/60/60/60 gate after all shards pass.
+          NODE_V8_COVERAGE="$PWD/coverage-shard" npm run test:unit:ci:shard
       - name: Upload raw shard coverage
         if: always()
         uses: actions/upload-artifact@v7

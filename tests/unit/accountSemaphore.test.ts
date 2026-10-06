@@ -80,19 +80,25 @@ describe("accountSemaphore acquireMany", () => {
 
   it("times out an atomic waiter without leaking reservations", async () => {
     const releaseGlobal = await acquire("global", { maxConcurrency: 1 });
-    await assert.rejects(
-      acquireMany(
-        [
-          { key: "global", maxConcurrency: 1 },
-          { key: "provider:codex", maxConcurrency: 1 },
-        ],
-        { timeoutMs: 10 }
-      ),
-      (error: Error & { code?: string }) => error.code === "SEMAPHORE_TIMEOUT"
-    );
-    assert.equal(getStats().global?.queued, 0);
-    assert.equal(getStats()["provider:codex"]?.running ?? 0, 0);
-    releaseGlobal();
+    // Production has a live server handle; the semaphore intentionally unrefs its timer.
+    const keepAlive = setInterval(() => {}, 250);
+    try {
+      await assert.rejects(
+        acquireMany(
+          [
+            { key: "global", maxConcurrency: 1 },
+            { key: "provider:codex", maxConcurrency: 1 },
+          ],
+          { timeoutMs: 10 }
+        ),
+        (error: Error & { code?: string }) => error.code === "SEMAPHORE_TIMEOUT"
+      );
+      assert.equal(getStats().global?.queued, 0);
+      assert.equal(getStats()["provider:codex"]?.running ?? 0, 0);
+    } finally {
+      clearInterval(keepAlive);
+      releaseGlobal();
+    }
   });
 
   it("rejects an atomic waiter when any required gate queue is full", async () => {

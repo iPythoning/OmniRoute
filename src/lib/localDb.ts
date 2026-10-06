@@ -116,6 +116,21 @@ export {
 } from "./db/apiKeys";
 
 export {
+  getPrepaidBalance,
+  listPrepaidEntries,
+  listPrepaidReservations,
+  creditPrepaid,
+  reservePrepaid,
+  dispatchPrepaid,
+  settlePrepaid,
+  releasePrepaid,
+  refundPrepaid,
+  PrepaidError,
+} from "./db/prepaid";
+export { getDurableDbInstance } from "./db/durable";
+export { hasFinancialState, FinancialStateRecoveryError } from "./db/financialState";
+
+export {
   // Evals
   saveEvalRun,
   listEvalRuns,

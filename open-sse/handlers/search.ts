@@ -44,6 +44,7 @@ import { sanitizeErrorMessage } from "../utils/error.ts";
 import { isValidContext7LibraryId } from "../executors/context7-fetch.ts";
 import { resolveSearchProxy, executeProviderFetch } from "./search/searchProxy.ts";
 import { formatSearchProviderFailure } from "./search/providerFailure.ts";
+import { executePrepaidSearch } from "@/lib/prepaid/search";
 
 export interface SearchResult {
   title: string;
@@ -116,6 +117,7 @@ interface SearchHandlerOptions {
   /** Connection ID (proxy resolution + call-log attribution) and API key ID (per-key proxy). */
   connectionId?: string;
   apiKeyId?: string;
+  onBillingReservation?: (id: string) => void;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -1454,6 +1456,7 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
     log,
     connectionId,
     apiKeyId,
+    onBillingReservation,
   } = options;
   const startTime = Date.now();
 
@@ -1546,7 +1549,8 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
         startTime,
         log,
         alternateCredentials?.connectionId,
-        apiKeyId
+        apiKeyId,
+        onBillingReservation
       );
     }
     return {
@@ -1564,7 +1568,8 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
     startTime,
     log,
     connectionId,
-    apiKeyId
+    apiKeyId,
+    onBillingReservation
   );
 
   if (result.success) return result;
@@ -1591,7 +1596,8 @@ export async function handleSearch(options: SearchHandlerOptions): Promise<Searc
       startTime,
       log,
       alternateCredentials?.connectionId,
-      apiKeyId
+      apiKeyId,
+      onBillingReservation
     );
 
     if (fallbackResult.success) return fallbackResult;
@@ -1700,6 +1706,18 @@ async function tryDuckDuckGoFreeProvider(
 }
 
 async function tryProvider(
+  ...args: [...Parameters<typeof tryProviderUnmetered>, onReservation?: (id: string) => void]
+): Promise<SearchHandlerResult> {
+  const [config, params, credentials, startTime, log, connectionId, apiKeyId, onReservation] = args;
+  return executePrepaidSearch(
+    apiKeyId,
+    config,
+    () => tryProviderUnmetered(config, params, credentials, startTime, log, connectionId, apiKeyId),
+    onReservation
+  );
+}
+
+async function tryProviderUnmetered(
   config: SearchProviderConfig,
   params: Omit<SearchRequestParams, "token">,
   credentials: Record<string, any>,

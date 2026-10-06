@@ -18,9 +18,15 @@ import { accessScheduleSchema } from "./misc.ts";
 
 // ──── API Key Schemas ────
 
-const requireExclusiveLeaseConnections = (value: {
-  scopes?: string[]; allowedConnections?: string[];
-}, ctx: z.RefinementCtx) => {
+export const idempotencyKeySchema = z.string().uuid();
+
+const requireExclusiveLeaseConnections = (
+  value: {
+    scopes?: string[];
+    allowedConnections?: string[];
+  },
+  ctx: z.RefinementCtx
+) => {
   if (value.scopes?.includes("lease:exclusive") && !value.allowedConnections?.length)
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -40,8 +46,23 @@ export const createKeySchema = z
     chaosModeEnabled: z.boolean().optional(),
     scopes: z.array(z.string().trim().min(1).max(64)).max(32).optional(),
     allowedConnections: z.array(z.string().uuid()).min(1).max(100).optional(),
+    modelAccessMode: z.enum(["all", "restricted"]).optional(),
+    allowedModels: z.array(z.string().trim().min(1)).max(1000).optional(),
+    allowedCombos: z.array(z.string().trim().min(1).max(200)).max(500).optional(),
+    compressionEnabled: z.boolean().optional(),
+    isActive: z.boolean().optional(),
+    prepaidEnabled: z.boolean().optional(),
   })
-  .superRefine(requireExclusiveLeaseConnections);
+  .superRefine(requireExclusiveLeaseConnections)
+  .superRefine((value, ctx) => {
+    if (value.modelAccessMode === "all" && value.allowedModels?.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "allowedModels must be empty when modelAccessMode is 'all'",
+        path: ["allowedModels"],
+      });
+    }
+  });
 
 export const createSyncTokenSchema = z.object({
   name: z.string().trim().min(1, "Name is required").max(200),

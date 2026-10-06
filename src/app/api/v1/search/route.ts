@@ -19,6 +19,7 @@ import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
 import { v1SearchSchema } from "@/shared/validation/schemas";
 import {
   formatValidationMessage,
@@ -348,6 +349,12 @@ async function postHandler(request: Request, context: unknown) {
   );
 
   const ttl = providerConfig.cacheTTLMs ?? SEARCH_CACHE_DEFAULT_TTL_MS;
+  const billingIds: string[] = [];
+  const responseHeaders = () => ({
+    "Content-Type": "application/json",
+    ...CORS_HEADERS,
+    ...(billingIds.length ? { [OMNIROUTE_RESPONSE_HEADERS.billingId]: billingIds.join(", ") } : {}),
+  });
 
   try {
     const { data: searchResult, cached } = await getOrCoalesce(cacheKey, ttl, async () => {
@@ -370,6 +377,7 @@ async function postHandler(request: Request, context: unknown) {
         log,
         connectionId: credentials?.connectionId || undefined,
         apiKeyId: policy.apiKeyInfo?.id || undefined,
+        onBillingReservation: (id) => billingIds.push(id),
       });
 
       if (!result.success) {
@@ -397,14 +405,14 @@ async function postHandler(request: Request, context: unknown) {
 
     return new Response(JSON.stringify(response), {
       status: 200,
-      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      headers: responseHeaders(),
     });
   } catch (err: any) {
     if (err instanceof SearchError) {
       const errorPayload = toJsonErrorPayload(err.message, "Search provider error");
       return new Response(JSON.stringify(errorPayload), {
         status: err.statusCode,
-        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+        headers: responseHeaders(),
       });
     }
 
@@ -412,7 +420,7 @@ async function postHandler(request: Request, context: unknown) {
     const errorPayload = toJsonErrorPayload(err.message, "Internal search error");
     return new Response(JSON.stringify(errorPayload), {
       status: 500,
-      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      headers: responseHeaders(),
     });
   }
 }

@@ -34,6 +34,7 @@ test.beforeEach(() => {
 });
 
 test.after(() => {
+  core.resetDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
   if (ORIGINAL_OMNIROUTE_API_KEY === undefined) delete process.env.OMNIROUTE_API_KEY;
   else process.env.OMNIROUTE_API_KEY = ORIGINAL_OMNIROUTE_API_KEY;
@@ -251,7 +252,7 @@ test("clientApiPolicy: x-goog-api-key header is accepted as client_api_key subje
   }
 });
 
-test("clientApiPolicy: Authorization Bearer wins over x-goog-api-key when both present (#7034)", async () => {
+test("clientApiPolicy: conflicting bearer and Google credentials are rejected", async () => {
   const created = await apiKeysDb.createApiKey("policy-test-goog-precedence", "machine-goog-2345");
   assert.ok(created?.key, "createApiKey must return a key");
 
@@ -261,14 +262,14 @@ test("clientApiPolicy: Authorization Bearer wins over x-goog-api-key when both p
     "x-goog-api-key": "sk-goog-should-lose",
   });
   const out = await policy.evaluate(ctx(headers));
-  assert.equal(out.allow, true);
-  if (out.allow) {
-    assert.equal(out.subject.kind, "client_api_key");
-    assert.match(out.subject.id, /^key_/);
+  assert.equal(out.allow, false);
+  if (!out.allow) {
+    assert.equal(out.status, 400);
+    assert.equal(out.code, "AUTH_002");
   }
 });
 
-test("clientApiPolicy: existing x-api-key still wins over x-goog-api-key when both present (#7034)", async () => {
+test("clientApiPolicy: conflicting API-key and Google credentials are rejected", async () => {
   const created = await apiKeysDb.createApiKey("policy-test-xkey-precedence", "machine-xkey-2345");
   assert.ok(created?.key, "createApiKey must return a key");
 
@@ -278,10 +279,10 @@ test("clientApiPolicy: existing x-api-key still wins over x-goog-api-key when bo
     "x-goog-api-key": "sk-goog-should-lose",
   });
   const out = await policy.evaluate(ctx(headers));
-  assert.equal(out.allow, true);
-  if (out.allow) {
-    assert.equal(out.subject.kind, "client_api_key");
-    assert.match(out.subject.id, /^key_/);
+  assert.equal(out.allow, false);
+  if (!out.allow) {
+    assert.equal(out.status, 400);
+    assert.equal(out.code, "AUTH_002");
   }
 });
 

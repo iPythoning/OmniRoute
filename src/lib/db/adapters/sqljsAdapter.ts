@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { SqliteAdapter, PreparedStatement, RunResult } from "./types";
+import { hasFinancialState } from "../financialState";
 
 const SAVE_DEBOUNCE_MS = 100;
 const CHECKPOINT_INTERVAL_MS = 60_000;
@@ -133,7 +134,19 @@ export async function createSqlJsAdapter(filePath: string): Promise<SqliteAdapte
   const SQLLib = await loadSqlJs();
   if (!SQLLib) throw new Error("[sqljsAdapter] Failed to load sql.js");
 
-  const buf = filePath !== ":memory:" && fs.existsSync(filePath) ? fs.readFileSync(filePath) : null;
+  function assertNoWal(): void {
+    if (
+      filePath !== ":memory:" &&
+      fs.existsSync(`${filePath}-wal`) &&
+      fs.statSync(`${filePath}-wal`).size > 0
+    ) {
+      throw new Error("A live WAL requires a native SQLite driver");
+    }
+  }
+  assertNoWal();
+  let sourceStat =
+    filePath !== ":memory:" && fs.existsSync(filePath) ? fs.statSync(filePath) : null;
+  const buf = sourceStat ? fs.readFileSync(filePath) : null;
   const db = new SQLLib.Database(buf ? new Uint8Array(buf) : undefined);
 
   let dirty = false;
@@ -167,6 +180,17 @@ export async function createSqlJsAdapter(filePath: string): Promise<SqliteAdapte
    */
   function persist(): void {
     if (filePath === ":memory:") return;
+    assertNoWal();
+    if (hasFinancialState({ prepare: makeStatement }))
+      throw new Error("Financial state requires a native SQLite driver");
+    const currentStat = fs.existsSync(filePath) ? fs.statSync(filePath) : null;
+    if (
+      currentStat?.ino !== sourceStat?.ino ||
+      currentStat?.mtimeMs !== sourceStat?.mtimeMs ||
+      currentStat?.size !== sourceStat?.size
+    ) {
+      throw new Error("Database changed outside this snapshot; refusing to overwrite it");
+    }
     const data = db.export();
     // Same directory, so `rename` stays within one filesystem — a temp file in
     // os.tmpdir() would make it a cross-device copy, which is not atomic.
@@ -181,6 +205,7 @@ export async function createSqlJsAdapter(filePath: string): Promise<SqliteAdapte
       fs.closeSync(fd);
       fd = null;
       fs.renameSync(tmpPath, filePath);
+      sourceStat = fs.statSync(filePath);
     } catch (err) {
       if (fd !== null) {
         try {
@@ -272,6 +297,11 @@ export async function createSqlJsAdapter(filePath: string): Promise<SqliteAdapte
         }
       },
     };
+  }
+
+  if (hasFinancialState({ prepare: makeStatement })) {
+    db.close();
+    throw new Error("Financial state requires a native SQLite driver");
   }
 
   const checkpointTimer = setInterval(() => {

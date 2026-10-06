@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import { getPrepaidBalance } from "@/lib/db/prepaid";
 import {
   getApiKeys,
   getCombos,
@@ -220,7 +221,9 @@ export async function buildConfigSyncBundle(): Promise<ConfigSyncBundle> {
       ["sortOrder", "name", "id"]
     ),
     apiKeys: sortByStringKeys(
-      apiKeys.map((apiKey) => sanitizeApiKeyForSync(apiKey)),
+      apiKeys
+        .filter((apiKey) => !getPrepaidBalance(String(apiKey.id)))
+        .map((apiKey) => sanitizeApiKeyForSync(apiKey)),
       ["name", "id"]
     ),
     reasoningRoutingRules: sortByStringKeys(

@@ -329,6 +329,13 @@ export async function isAuthRequired(
   request?: RequestLike | Request | null | undefined
 ): Promise<boolean> {
   try {
+    const [{ getDbInstance }, { hasFinancialState }] = await Promise.all([
+      import("@/lib/db/core"),
+      import("@/lib/db/financialState"),
+    ]);
+    // Once financial state exists, anonymous management could mint administrators,
+    // reveal credentials or replace the database, bypassing ledger authentication.
+    if (hasFinancialState(getDbInstance())) return true;
     const settings = await getSettings();
     if (settings.requireLogin === false) return false;
 

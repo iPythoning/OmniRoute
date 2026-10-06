@@ -15,9 +15,11 @@ import {
 import path from "path";
 import { retryProbeIfTransient } from "./probeUtils";
 import fs from "fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { resolveWritableDataDir, getLegacyDotDataDir } from "../dataPaths";
 import { isNextBuildPhase } from "../buildPhase";
 import { runMigrations } from "./migrationRunner";
+import { hasFinancialState, FinancialStateRecoveryError } from "./financialState";
 import { runDbHealthCheck } from "./healthCheck";
 import { resetAllDbModuleState } from "./stateReset";
 import { parseStoredPayload } from "../logPayloads";
@@ -103,6 +105,7 @@ export const isBuildPhase = isNextBuildPhase();
 export const DATA_DIR = resolveWritableDataDir({ isCloud });
 const LEGACY_DATA_DIR = isCloud ? null : getLegacyDotDataDir();
 export const SQLITE_FILE = isCloud ? null : path.join(DATA_DIR, "storage.sqlite");
+export const DB_RESTORE_MARKER = SQLITE_FILE ? `${SQLITE_FILE}.restore-in-progress` : null;
 const JSON_DB_FILE = isCloud ? null : path.join(DATA_DIR, "db.json");
 export const DB_BACKUPS_DIR = isCloud ? null : path.join(DATA_DIR, "db_backups");
 const DEFAULT_CRITICAL_TABLE_ROW_LIMIT = 10_000;
@@ -515,6 +518,12 @@ const SCHEMA_SQL = `
 
 declare global {
   var __omnirouteDb: SqliteAdapter | undefined;
+  var __omnirouteDbMaintenance:
+    | {
+        owner: symbol | null;
+        context: AsyncLocalStorage<symbol>;
+      }
+    | undefined;
   // Cycle-breaker counter for the probe-failed/restore cascade. Survives
   // Next.js HMR re-evaluations so concurrent subsystems all see the same
   // count and we abort with a clear error instead of looping forever.
@@ -531,6 +540,27 @@ declare global {
 
 function getDb(): SqliteDatabase | null {
   return globalThis.__omnirouteDb ?? null;
+}
+
+export async function withDbMaintenance<T>(operation: () => Promise<T>): Promise<T> {
+  const state = (globalThis.__omnirouteDbMaintenance ??= {
+    owner: null,
+    context: new AsyncLocalStorage<symbol>(),
+  });
+  if (state.owner || (DB_RESTORE_MARKER && fs.existsSync(DB_RESTORE_MARKER)))
+    throw new Error("Database maintenance is in progress");
+  const owner = Symbol("database-maintenance");
+  state.owner = owner;
+  return state.context.run(owner, async () => {
+    try {
+      // Invalidate handles obtained before the fence, including callers paused at an await.
+      resetDbInstance();
+      return await operation();
+    } finally {
+      // A failed replacement without a usable restored handle stays fenced until restart.
+      if (getDb()?.open) state.owner = null;
+    }
+  });
 }
 
 function setDb(db: SqliteDatabase | null): void {
@@ -596,6 +626,11 @@ function captureCriticalDbState(sqliteFile: string): PreservedCriticalDbState {
   let probe: SqliteDatabase | null = null;
   try {
     probe = openSqliteDatabase(sqliteFile, { readonly: true });
+
+    // Selective configuration salvage cannot establish ledger/receipt completeness.
+    // Preserve the original file and require a full restore rather than resurrecting
+    // an unmetered key or allowing an already acknowledged issuance to run twice.
+    if (hasFinancialState(probe)) throw new FinancialStateRecoveryError();
 
     for (const tableSpec of CRITICAL_DB_TABLES) {
       if (!hasTable(probe, tableSpec.table)) continue;
@@ -1029,6 +1064,13 @@ export function runManagedDbHealthCheck(options?: { autoRepair?: boolean }) {
 }
 
 export function getDbInstance(): SqliteDatabase {
+  const maintenance = globalThis.__omnirouteDbMaintenance;
+  if (
+    (maintenance?.owner && maintenance.context.getStore() !== maintenance.owner) ||
+    (!maintenance?.owner && DB_RESTORE_MARKER && fs.existsSync(DB_RESTORE_MARKER))
+  ) {
+    throw new Error("Database maintenance is in progress");
+  }
   const existing = getDb();
   if (existing) return existing;
 
@@ -1164,6 +1206,10 @@ export function getDbInstance(): SqliteDatabase {
         .get();
 
       if (hasOldSchema) {
+        if (hasFinancialState(probe)) {
+          closeProbeIfSafe(probe);
+          throw new FinancialStateRecoveryError();
+        }
         let hasData = false;
         try {
           const count = probe.prepare("SELECT COUNT(*) as c FROM provider_connections").get() as
@@ -1206,6 +1252,7 @@ export function getDbInstance(): SqliteDatabase {
         closeProbeIfSafe(probe);
       }
     } catch (e: unknown) {
+      if (e instanceof FinancialStateRecoveryError) throw e;
       const message = e instanceof Error ? e.message : String(e);
       console.warn("[DB] Could not probe existing DB:", message);
 
@@ -1252,6 +1299,10 @@ export function getDbInstance(): SqliteDatabase {
       }
       if (!retryProbeIfTransient(sqliteFile, e, openSqliteDatabase, closeProbeIfSafe)) {
         preservedCriticalState = captureCriticalDbState(sqliteFile);
+        if (preservedCriticalState.captureError === new FinancialStateRecoveryError().message) {
+          // Keep the main file and its WAL together at their original paths.
+          throw new FinancialStateRecoveryError();
+        }
         // SAFETY: Never delete the database — rename to backup so data can be recovered.
         // The old code would silently destroy all user data on any probe failure.
         const failedPath = sqliteFile + `.probe-failed-${Date.now()}`;

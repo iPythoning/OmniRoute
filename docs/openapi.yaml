@@ -2182,21 +2182,190 @@ paths:
     post:
       tags: [API Keys]
       summary: Create API key
+      description: >-
+        An optional UUID Idempotency-Key persists an issuance receipt. Identical retries
+        return the same credential and its current policy. Changed requests and retries
+        after deletion, revocation, expiry or rotation return 409. Idempotent issuance
+        and prepaid account creation always require management authentication.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema:
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [label]
+              required: [name]
               properties:
-                label:
+                name:
                   type: string
+                prepaidEnabled:
+                  type: boolean
+                  description: >-
+                    Atomically create a zero-balance cumulative prepaid account. Prepaid chat
+                    supports text generation and client-executed function tools. Hosted tools,
+                    audio generation and multiple-candidate billing are rejected. Automatic
+                    memory and server-side skill enrichment are disabled for prepaid requests.
+                modelAccessMode:
+                  type: string
+                  enum: [all, restricted]
+                allowedModels:
+                  type: array
+                  items:
+                    type: string
+                allowedCombos:
+                  type: array
+                  items:
+                    type: string
+                compressionEnabled:
+                  type: boolean
+                isActive:
+                  type: boolean
       responses:
+        "200":
+          description: Existing issuance replayed; Cache-Control is no-store.
         "201":
           description: Created API key (includes full key value)
         "401":
           description: Authentication required
+        "409":
+          description: Conflicting issuance or retired credential
+
+  /api/usage/prepaid:
+    get:
+      tags: [Usage]
+      summary: Read a cumulative prepaid balance and optional reservation or ledger page
+      description: >-
+        Always requires management authentication. Amounts are USD decimal strings
+        with nine fractional digits. Available balance is balance minus reserved funds.
+        Balances have no periodic reset. Configuration sync excludes prepaid credentials;
+        recovery requires the complete authoritative SQLite database.
+        Once financial state exists, management requires authentication even in local mode.
+        The entries view exposes settled charge IDs for refunds.
+      parameters:
+        - in: query
+          name: apiKeyId
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: limit
+          description: Include this many records from the selected view, ordered by cursor.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - in: query
+          name: view
+          schema:
+            type: string
+            enum: [reservations, entries]
+            default: reservations
+        - in: query
+          name: after
+          description: Return records after this cursor from the selected view.
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Balance and optional reservations or entries page; Cache-Control is no-store.
+        "400":
+          description: Invalid identifier or pagination
+        "401":
+          description: Authentication required
+        "403":
+          description: Management permission required
+        "404":
+          description: Prepaid account not found
+        "503":
+          description: Ledger unavailable
+    post:
+      tags: [Usage]
+      summary: Credit, refund or reconcile a prepaid account idempotently
+      description: >-
+        Always requires management authentication. Input amounts are decimal strings
+        with at most nine fractional digits; numbers, negatives, overflow and excess
+        precision are rejected. Credit and refund must be positive. Refunds reference
+        a settled charge and cannot exceed its remaining refundable amount. Reconciliation
+        requires nonempty evidence and an Idempotency-Key equal to the reservation ID;
+        undispatched reservations can only be reconciled to zero. Changed replays conflict.
+        Unknown upstream outcomes retain reservations for evidence-backed reconciliation.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  additionalProperties: false
+                  required: [kind, apiKeyId, amountUsd]
+                  properties:
+                    kind:
+                      type: string
+                      enum: [credit]
+                    apiKeyId:
+                      type: string
+                      format: uuid
+                    amountUsd:
+                      type: string
+                - type: object
+                  additionalProperties: false
+                  required: [kind, chargeId, amountUsd]
+                  properties:
+                    kind:
+                      type: string
+                      enum: [refund]
+                    chargeId:
+                      type: string
+                      format: uuid
+                    amountUsd:
+                      type: string
+                - type: object
+                  additionalProperties: false
+                  required: [kind, reservationId, amountUsd, evidence]
+                  properties:
+                    kind:
+                      type: string
+                      enum: [reconcile]
+                    reservationId:
+                      type: string
+                      format: uuid
+                    amountUsd:
+                      type: string
+                    evidence:
+                      type: string
+                      minLength: 1
+                      maxLength: 2000
+      responses:
+        "200":
+          description: Operation applied or replayed; current balance and entryId returned.
+        "400":
+          description: Invalid request or amount
+        "401":
+          description: Authentication required
+        "402":
+          description: Settlement exceeds the reserved amount
+        "403":
+          description: Management permission required
+        "404":
+          description: Referenced account, reservation or charge not found
+        "409":
+          description: Conflicting replay, invalid transition or excessive refund
+        "503":
+          description: Ledger unavailable
 
   /api/keys/{id}:
     get:

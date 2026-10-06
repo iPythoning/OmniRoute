@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import type { PreparedStatement, RunResult, SqliteAdapter } from "./types";
 
 /**
@@ -125,11 +124,8 @@ export function createBunSqliteAdapter(db: BunSqliteDatabaseLike, filePath: stri
     },
 
     async backup(destination: string): Promise<void> {
-      if (filePath === ":memory:") return;
-      try {
-        db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-      } catch {}
-      await fs.promises.copyFile(filePath, destination);
+      // SQLite creates a consistent snapshot including committed WAL pages.
+      db.query("VACUUM INTO ?").run(destination);
     },
 
     checkpoint(mode = "TRUNCATE"): void {

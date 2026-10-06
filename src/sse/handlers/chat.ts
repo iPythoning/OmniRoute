@@ -28,6 +28,8 @@ import { getCombo, getComboForModel, getModelInfo } from "../services/model";
 import { stripContextWindowSuffix } from "@omniroute/open-sse/services/model.ts";
 import { resolveBareModelToConnectionDefault } from "@omniroute/open-sse/services/model.ts";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
+import { getPrepaidBalance } from "@/lib/db/prepaid";
+import { assertPrepaidChatBody, PrepaidInferenceError } from "@/lib/prepaid/inference";
 import { getImageModelEntry } from "@omniroute/open-sse/config/imageRegistry.ts";
 import { acceptHeaderForcesStream } from "@omniroute/open-sse/utils/aiSdkCompat.ts";
 import { applyNoThinkingAlias } from "@omniroute/open-sse/utils/noThinkingAlias.ts";
@@ -696,13 +698,25 @@ async function handleChatImplementation(
 
   // Guardrail pre-call pipeline — prompt injection, PII masking, and future custom rules.
   telemetry.startPhase("validate");
+  let prepaidEnabled = false;
+  try {
+    prepaidEnabled = Boolean(apiKeyInfo?.id && getPrepaidBalance(apiKeyInfo.id));
+    if (prepaidEnabled) assertPrepaidChatBody(body);
+  } catch (error) {
+    return errorResponse(
+      error instanceof PrepaidInferenceError ? error.status : 503,
+      error instanceof PrepaidInferenceError
+        ? error.message
+        : "Prepaid billing is temporarily unavailable"
+    );
+  }
   const preCallGuardrails = await guardrailRegistry.runPreCallHooks(body, {
     apiKeyInfo: apiKeyInfo as any,
     disabledGuardrails: resolveDisabledGuardrails({
       apiKeyInfo: (apiKeyInfo ?? null) as any,
       body,
       headers: request.headers,
-    }),
+    }).concat(prepaidEnabled ? ["vision-bridge", "audio-bridge", "video-bridge"] : []),
     endpoint: new URL(request.url).pathname,
     headers: request.headers,
     log,

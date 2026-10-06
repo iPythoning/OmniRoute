@@ -8,7 +8,7 @@
  * @module shared/utils/apiKeyPolicy
  */
 
-import { extractApiKey } from "@/sse/services/auth";
+import { resolveClientApiKey } from "@/sse/services/auth";
 import {
   getApiKeyMetadata,
   getComboByName,
@@ -32,6 +32,9 @@ import { resolveQuotaKeyScope } from "@/lib/quota/quotaKey";
 import { isQuotaModelName, parseQuotaModelName } from "@/lib/quota/quotaModelNaming";
 import { buildApiKeyUsageLimitPolicyRejection } from "@/lib/usage/apiKeyUsageLimits";
 import { ALL_COMBOS_ACCESS_RULE } from "@/shared/constants/comboAccess";
+import { prepaidRequestRejection } from "@/lib/prepaid/policy";
+import { AUTHZ_HEADER_AUTH_KIND } from "@/server/authz/headers";
+import { isRequireApiKeyEnabled } from "./featureFlags";
 
 // Default to no per-key request cap. API keys can still opt into explicit
 // limits via Settings/API Keys, while provider/account quota controls remain
@@ -645,37 +648,20 @@ async function validateRateLimitAndThrottle(context: PolicyContext): Promise<Res
   return null;
 }
 
-/**
- * A bare `x-api-key` / `x-goog-api-key` (no anthropic-version, no claude
- * user-agent) is accepted by the CLIENT_API auth layer (clientApi.ts
- * `extractBearer`) but ignored by the Issue-#2225-gated `extractApiKey()` used
- * for policy resolution — so a genuine key sent that way passed auth while
- * skipping its own allowedModels / budget / rate-limit policy
- * (GHSA-2phc-xp22-9f56). Resolve those headers here so the policy layer sees the
- * same key auth accepted. Bearer, URL-token and anthropic-gated paths are already
- * covered by `extractApiKey()`; unknown keys still fail open downstream, so this
- * only tightens enforcement for real keys.
- */
-function extractUngatedClientApiKey(request: Request): string | null {
-  const xApiKey = request.headers.get("x-api-key") ?? request.headers.get("X-Api-Key");
-  if (xApiKey && xApiKey.trim()) return xApiKey.trim();
-  const xGoog = request.headers.get("x-goog-api-key") ?? request.headers.get("X-Goog-Api-Key");
-  if (xGoog && xGoog.trim()) return xGoog.trim();
-  return null;
-}
-
 export async function enforceApiKeyPolicy(
   request: Request,
   modelStr: string | null
 ): Promise<ApiKeyPolicyResult> {
-  // A real bearer key wins; then a bare x-api-key/x-goog-api-key that auth
-  // accepted but extractApiKey() gates out; otherwise an authenticated dashboard
-  // playground may test a specific key's policy by id (resolved server-side,
-  // secret never sent).
-  const apiKey =
-    extractApiKey(request) ||
-    extractUngatedClientApiKey(request) ||
-    (await resolvePlaygroundTestKey(request));
+  // Authentication, policy and billing must resolve the same credential.
+  const { key, conflicting } = resolveClientApiKey(request);
+  if (conflicting) {
+    return {
+      apiKey: null,
+      apiKeyInfo: null,
+      rejection: errorResponse(400, "Conflicting API credentials"),
+    };
+  }
+  const apiKey = key || (await resolvePlaygroundTestKey(request));
 
   // No API key = local/session mode, skip policy checks
   if (!apiKey) {
@@ -696,14 +682,32 @@ export async function enforceApiKeyPolicy(
     };
   }
 
-  // Key not found in DB — skip policy (auth layer handles validation)
+  // A key can disappear after authentication. Never downgrade that request to
+  // anonymous/unmetered traffic; unknown keys are allowed only in local mode.
   if (!apiKeyInfo) {
+    if (
+      isRequireApiKeyEnabled() ||
+      request.headers.get(AUTHZ_HEADER_AUTH_KIND) === "client_api_key"
+    ) {
+      return {
+        apiKey,
+        apiKeyInfo: null,
+        rejection: errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key"),
+      };
+    }
     return { apiKey, apiKeyInfo: null, rejection: null };
   }
 
   const context = { request, apiKey, apiKeyInfo, modelStr };
   const statusRejection = validateKeyStatus(context);
   if (statusRejection) return { apiKey, apiKeyInfo, rejection: statusRejection };
+  const prepaidRejection = prepaidRequestRejection(apiKeyInfo.id, request);
+  if (prepaidRejection)
+    return {
+      apiKey,
+      apiKeyInfo,
+      rejection: errorResponse(prepaidRejection.status, prepaidRejection.message),
+    };
   const scheduleRejection = await validateKeyScheduleAndUsage(context);
   if (scheduleRejection) return { apiKey, apiKeyInfo, rejection: scheduleRejection };
   const endpointRejection = validateEndpointAccess(context);

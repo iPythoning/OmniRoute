@@ -1,9 +1,9 @@
 import { isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth.ts";
 import { isRequireApiKeyEnabled } from "@/shared/utils/featureFlags";
-import { extractApiKey } from "@/sse/services/auth.ts";
-import { extractGoogApiKeyHeader } from "@/sse/services/googApiKeyAuth.ts";
+import { resolveClientApiKey } from "@/sse/services/auth.ts";
 import type { AuthOutcome, PolicyContext, RoutePolicy } from "../context";
 import { allow, reject } from "../context";
+import { prepaidRequestRejection } from "@/lib/prepaid/policy";
 
 const HANDSHAKE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
@@ -18,37 +18,6 @@ function isWsHandshake(ctx: PolicyContext): boolean {
   }
 }
 
-function extractBearer(request: Request): string | null {
-  const raw = request.headers.get("authorization") ?? request.headers.get("Authorization");
-  const xApiKey = request.headers.get("x-api-key") ?? request.headers.get("X-Api-Key");
-  const xGoogApiKey = extractGoogApiKeyHeader(request.headers);
-  if (raw) {
-    const trimmed = raw.trim();
-    if (trimmed.toLowerCase().startsWith("bearer ")) {
-      const token = trimmed.slice(7).trim();
-      if (token) return token;
-    }
-    // A non-"Bearer <token>" Authorization header (an empty "Bearer ", or a
-    // client's own non-OmniRoute token — VS Code Copilot sends one even when the
-    // OmniRoute key lives in the URL path of a /vscode tokenized endpoint) must
-    // NOT short-circuit auth. Fall through to x-api-key and the path-scoped URL
-    // token below instead of rejecting the request with "Authentication required".
-  }
-
-  if (xApiKey) {
-    return xApiKey.trim() || null;
-  }
-
-  // Issue #7034: gemini-cli (and any @google/genai-based client) sends its
-  // key via x-goog-api-key exclusively — accept it unconditionally, same
-  // shape as the x-api-key fallback above.
-  if (xGoogApiKey) {
-    return xGoogApiKey;
-  }
-
-  return extractApiKey(request);
-}
-
 function maskKeyId(apiKey: string): string {
   const tail = apiKey.slice(-4);
   return `key_${tail}`;
@@ -57,7 +26,8 @@ function maskKeyId(apiKey: string): string {
 export const clientApiPolicy: RoutePolicy = {
   routeClass: "CLIENT_API",
   async evaluate(ctx: PolicyContext): Promise<AuthOutcome> {
-    const bearer = extractBearer(ctx.request as Request);
+    const { key: bearer, conflicting } = resolveClientApiKey(ctx.request as Request);
+    if (conflicting) return reject(400, "AUTH_002", "Conflicting API credentials");
     if (!bearer) {
       // The WS descriptor handshake is a metadata read; the route handler
       // performs the actual wsAuth/dashboard/API-key decision and returns the
@@ -77,7 +47,7 @@ export const clientApiPolicy: RoutePolicy = {
       return reject(401, "AUTH_002", "Authentication required");
     }
 
-    const { validateApiKey } = await import("../../../lib/db/apiKeys");
+    const { validateApiKey, getApiKeyMetadata } = await import("../../../lib/db/apiKeys");
     const ok = await validateApiKey(bearer);
     if (!ok) {
       // Issue #2257: when REQUIRE_API_KEY is off, a stale CLI config (Codex
@@ -96,6 +66,12 @@ export const clientApiPolicy: RoutePolicy = {
       return reject(401, "AUTH_002", "Invalid API key");
     }
 
+    const metadata = await getApiKeyMetadata(bearer);
+    const prepaidRejection = metadata
+      ? prepaidRequestRejection(metadata.id, ctx.request as Request)
+      : null;
+    if (prepaidRejection)
+      return reject(prepaidRejection.status, "PREPAID_UNAVAILABLE", prepaidRejection.message);
     return allow({ kind: "client_api_key", id: maskKeyId(bearer) });
   },
 };

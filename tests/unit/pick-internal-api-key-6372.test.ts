@@ -42,6 +42,14 @@ test("internal probes never auto-select a hard-lease key", async () => {
   assert.equal(await apiKeysDb.pickApiKeyForInternalUse("internal-probe"), null);
 });
 
+test("internal probes never spend a tenant's prepaid balance", async () => {
+  await apiKeysDb.createApiKey("prepaid-tenant", "machine-a", ["manage"], { prepaidEnabled: true });
+  assert.equal(await apiKeysDb.pickApiKeyForInternalUse("combo-health-check"), null);
+  assert.equal(await apiKeysDb.pickApiKeyForInternalUse("cloud-sync-verify"), null);
+  const internal = await apiKeysDb.createApiKey("internal", "machine-a");
+  assert.equal(await apiKeysDb.pickApiKeyForInternalUse("internal-probe"), internal.key);
+});
+
 test("#6372: prefers a management-scoped key over a plain self:usage key", async () => {
   // Insert the plain (restricted-intent) key FIRST so getApiKeys()[0] would be
   // the wrong one under the old naive selection.

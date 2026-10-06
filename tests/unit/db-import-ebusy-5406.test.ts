@@ -16,12 +16,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..", "..");
 const importRoute = join(repoRoot, "src/app/api/db-backups/import/route.ts");
 
-test("#5406: import route uses unlinkFileWithRetry (EBUSY-safe on Windows)", () => {
+test("#5406: import route shares the EBUSY-safe replacement used by restore", () => {
   const src = readFileSync(importRoute, "utf8");
   assert.match(
     src,
-    /unlinkFileWithRetry/,
-    "import route must delete the sqlite files via unlinkFileWithRetry (EBUSY retry)"
+    /await replaceDbFromBackup\(tmpPath\)/,
+    "import must use the fenced, rollback-capable database replacement"
   );
 });
 

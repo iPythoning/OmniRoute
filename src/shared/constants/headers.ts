@@ -1,4 +1,5 @@
 export const OMNIROUTE_RESPONSE_HEADERS = {
+  billingId: "X-OmniRoute-Billing-Id",
   cache: "X-OmniRoute-Cache",
   cacheHit: "X-OmniRoute-Cache-Hit",
   cacheLatency: "X-OmniRoute-Cache-Latency",

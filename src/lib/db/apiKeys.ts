@@ -59,12 +59,16 @@ import {
   evictModelPermissionCache,
 } from "./apiKeys/modelPermissionCache";
 import type { ModelAccessMode } from "./apiKeys/modelAccessMode";
+import { normalizeModelAccessUpdate } from "./apiKeys/modelAccessMode";
 import {
   normalizeApiKeyPermissionsUpdate,
   type ApiKeyPermissionsUpdate,
 } from "./apiKeys/permissionsUpdate";
 import { getModelCatalogCacheVersion, invalidateModelCatalogCache } from "./readCache";
 import type { AccessSchedule, RateLimitRule } from "./apiKeys/types";
+import { idempotencyKeySchema } from "@/shared/validation/schemas/keys";
+import { createPrepaidAccount, getPrepaidBalance } from "./prepaid";
+import { getDurableDbInstance } from "./durable";
 
 // ──────────────── Performance Optimizations ────────────────
 
@@ -233,9 +237,7 @@ function assertExclusiveLeaseKeyPolicy(
   allowedConnections: readonly string[]
 ): void {
   if (scopes.includes(EXCLUSIVE_LEASE_SCOPE) && allowedConnections.length === 0) {
-    throw new ApiKeyPolicyInvariantError(
-      "lease:exclusive requires explicit allowedConnections"
-    );
+    throw new ApiKeyPolicyInvariantError("lease:exclusive requires explicit allowedConnections");
   }
 }
 
@@ -346,7 +348,7 @@ async function getModelPermissionCandidates(modelId: string): Promise<string[]> 
         providerOrAlias,
         providerScopedModel,
         resolveProviderId,
-        getProviderAlias,
+        getProviderAlias
       );
     }
     return Array.from(candidates);
@@ -364,7 +366,7 @@ async function getModelPermissionCandidates(modelId: string): Promise<string[]> 
 }
 
 async function getPublishedModelLookupTarget(
-  modelId: string,
+  modelId: string
 ): Promise<{ providerId: string; modelId: string } | null> {
   const cleanModelId = stripExtendedContextSuffix(modelId.trim());
   if (!cleanModelId) return null;
@@ -393,7 +395,7 @@ async function getPublishedModelLookupTarget(
 function ensureApiKeyColumn(
   db: ApiKeysDbLike,
   columnNames: Set<string>,
-  column: (typeof API_KEY_COLUMN_FALLBACKS)[number],
+  column: (typeof API_KEY_COLUMN_FALLBACKS)[number]
 ): void {
   if (columnNames.has(column.name)) return;
   db.exec(`ALTER TABLE api_keys ADD COLUMN ${column.definition}`);
@@ -433,10 +435,10 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
     _stmtGetAllKeys = db.prepare<ApiKeyRow>("SELECT * FROM api_keys ORDER BY created_at");
     _stmtGetKeyById = db.prepare<ApiKeyRow>("SELECT * FROM api_keys WHERE id = ?");
     _stmtValidateKey = db.prepare<JsonRecord>(
-      "SELECT id, expires_at, revoked_at, is_active, is_banned FROM api_keys WHERE key = ? OR key_hash = ?",
+      "SELECT id, expires_at, revoked_at, is_active, is_banned FROM api_keys WHERE key = ? OR key_hash = ?"
     );
     _stmtGetKeyMetadata = db.prepare<ApiKeyRow>(
-      "SELECT id, name, machine_id, model_access_mode, allowed_models, blocked_models, allowed_combos, allowed_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, cache_default_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, chaos_mode_enabled, compression_enabled, proxy_id FROM api_keys WHERE key = ? OR key_hash = ?",
+      "SELECT id, name, machine_id, model_access_mode, allowed_models, blocked_models, allowed_combos, allowed_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, cache_default_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, chaos_mode_enabled, compression_enabled, proxy_id FROM api_keys WHERE key = ? OR key_hash = ?"
     );
     _stmtInsertKey = db.prepare(
       "INSERT INTO api_keys (id, name, key, machine_id, allowed_models, allowed_combos, allowed_connections, no_log, created_at, key_prefix, key_hash, scopes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -497,7 +499,7 @@ export async function getApiKeys(limit?: number, offset?: number) {
     camelRow.streamDefaultMode = parseStreamDefaultMode((camelRow as JsonRecord).streamDefaultMode);
     camelRow.cacheDefaultMode = parseCacheDefaultMode((camelRow as JsonRecord).cacheDefaultMode);
     camelRow.disableNonPublicModels = parseDisableNonPublicModels(
-      (camelRow as JsonRecord).disableNonPublicModels,
+      (camelRow as JsonRecord).disableNonPublicModels
     );
     camelRow.allowUsageCommand = parseAllowUsageCommand((camelRow as JsonRecord).allowUsageCommand);
     camelRow.chaosModeEnabled = parseChaosModeEnabled((camelRow as JsonRecord).chaosModeEnabled);
@@ -556,10 +558,11 @@ export async function getExclusiveLeaseConnectionIds(): Promise<Set<string>> {
  * inactive, banned, or hard-lease key, and it never widens a key's allowedModels.
  */
 export async function pickApiKeyForInternalUse(
-  purpose: "combo-health-check" | "cloud-sync-verify" | "internal-probe" = "internal-probe",
+  purpose: "combo-health-check" | "cloud-sync-verify" | "internal-probe" = "internal-probe"
 ): Promise<string | null> {
   try {
     const keys = (await getApiKeys()) as Array<{
+      id: string;
       key?: string;
       isActive?: boolean;
       revokedAt?: string | null;
@@ -575,11 +578,12 @@ export async function pickApiKeyForInternalUse(
       k.isActive !== false &&
       !k.revokedAt &&
       k.isBanned !== true &&
+      !getPrepaidBalance(k.id) &&
       !k.scopes?.includes(EXCLUSIVE_LEASE_SCOPE);
 
     // 1. Management-scoped key (preferred for any internal probe).
     const manageKey = keys.find(
-      (k) => isUsable(k) && Array.isArray(k.scopes) && k.scopes.includes("manage"),
+      (k) => isUsable(k) && Array.isArray(k.scopes) && k.scopes.includes("manage")
     );
     if (manageKey?.key) return manageKey.key;
 
@@ -616,6 +620,10 @@ export async function getApiKeyById(id: string) {
   const stmt = getPreparedStatements(db);
   const row = stmt.getKeyById.get(id);
   if (!row) return null;
+  return apiKeyRowView(row);
+}
+
+function apiKeyRowView(row: ApiKeyRow): ApiKeyView {
   const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
   camelRow.modelAccessMode = parseModelAccessMode(camelRow.modelAccessMode, camelRow.allowedModels);
   camelRow.allowedModels = parseAllowedModels(camelRow.allowedModels);
@@ -634,7 +642,7 @@ export async function getApiKeyById(id: string) {
   camelRow.streamDefaultMode = parseStreamDefaultMode((camelRow as JsonRecord).streamDefaultMode);
   camelRow.cacheDefaultMode = parseCacheDefaultMode((camelRow as JsonRecord).cacheDefaultMode);
   camelRow.disableNonPublicModels = parseDisableNonPublicModels(
-    (camelRow as JsonRecord).disableNonPublicModels,
+    (camelRow as JsonRecord).disableNonPublicModels
   );
   camelRow.allowUsageCommand = parseAllowUsageCommand((camelRow as JsonRecord).allowUsageCommand);
   camelRow.chaosModeEnabled = parseChaosModeEnabled((camelRow as JsonRecord).chaosModeEnabled);
@@ -662,7 +670,7 @@ export async function createApiKey(
   name: string,
   machineId: string,
   scopes: string[] = [],
-  options: { allowedConnections?: string[] } = {}
+  options: ApiKeyCreateOptions = {}
 ) {
   if (!machineId) {
     throw new Error("machineId is required");
@@ -670,7 +678,9 @@ export async function createApiKey(
   const allowedConnections = options.allowedConnections ?? [];
   assertExclusiveLeaseKeyPolicy(scopes, allowedConnections);
 
-  const db = getDbInstance() as ApiKeysDbLike;
+  if (options.idempotencyKey !== undefined) idempotencyKeySchema.parse(options.idempotencyKey);
+  const db =
+    options.idempotencyKey || options.prepaidEnabled ? getDurableDbInstance() : getDbInstance();
   const now = new Date().toISOString();
 
   const { generateApiKeyWithMachine } = await import("@/shared/utils/apiKey");
@@ -681,39 +691,168 @@ export async function createApiKey(
     name: name,
     key: result.key,
     machineId: machineId,
-    modelAccessMode: "all" as const,
-    allowedModels: [], // Empty array means all models allowed
-    allowedCombos: [ALL_COMBOS_ACCESS_RULE], // Explicit wildcard means all combos allowed
+    ...normalizeModelAccessUpdate(options.modelAccessMode, options.allowedModels ?? []),
+    allowedCombos: options.allowedCombos ?? [ALL_COMBOS_ACCESS_RULE],
     allowedConnections,
-    noLog: false,
-    allowUsageCommand: false,
+    noLog: options.noLog === true,
+    allowUsageCommand: options.allowUsageCommand === true,
+    usageLimitEnabled: options.usageLimitEnabled === true,
+    dailyUsageLimitUsd: options.dailyUsageLimitUsd ?? null,
+    weeklyUsageLimitUsd: options.weeklyUsageLimitUsd ?? null,
+    chaosModeEnabled: options.chaosModeEnabled === true,
     createdAt: now,
     scopes,
   };
 
-  const stmt = getPreparedStatements(db);
-  stmt.insertKey.run(
-    apiKey.id,
-    apiKey.name,
-    apiKey.key,
-    apiKey.machineId,
-    "[]",
-    JSON.stringify(apiKey.allowedCombos),
-    JSON.stringify(allowedConnections),
-    0,
-    apiKey.createdAt,
-    apiKey.key.slice(0, 12),
-    await hashKey(apiKey.key),
-    JSON.stringify(scopes),
-  );
-  setNoLog(apiKey.id, false);
+  const stmt = getPreparedStatements(db as ApiKeysDbLike);
+  const keyHash = await hashKey(apiKey.key);
+  const policy = {
+    modelAccessMode: apiKey.modelAccessMode,
+    isActive: options.isActive,
+    compressionEnabled: options.compressionEnabled,
+    allowUsageCommand: apiKey.allowUsageCommand,
+    usageLimitEnabled: apiKey.usageLimitEnabled,
+    dailyUsageLimitUsd: apiKey.dailyUsageLimitUsd,
+    weeklyUsageLimitUsd: apiKey.weeklyUsageLimitUsd,
+    chaosModeEnabled: apiKey.chaosModeEnabled,
+  };
+  // Fixed field order and normalized values make the receipt independent of JSON property order.
+  const requestHash = createHash("sha256")
+    .update(
+      JSON.stringify({
+        name,
+        machineId,
+        scopes,
+        allowedConnections,
+        allowedModels: apiKey.allowedModels,
+        allowedCombos: apiKey.allowedCombos,
+        noLog: apiKey.noLog,
+        prepaidEnabled: options.prepaidEnabled === true,
+        ...policy,
+      })
+    )
+    .digest("hex");
+  let keyId = apiKey.id;
+  let replayed = false;
+  let persistedRow: ApiKeyRow | undefined;
+  db.immediate(() => {
+    if (options.idempotencyKey) {
+      const receipt = db
+        .prepare(
+          "SELECT request_hash, api_key_id, key_hash FROM api_key_issuances WHERE idempotency_key = ?"
+        )
+        .get(options.idempotencyKey) as
+        { request_hash: string; api_key_id: string; key_hash: string } | undefined;
+      if (receipt) {
+        const row = stmt.getKeyById.get(receipt.api_key_id);
+        if (
+          receipt.request_hash !== requestHash ||
+          !row ||
+          row.key_hash !== receipt.key_hash ||
+          row.revoked_at ||
+          row.is_banned ||
+          (row.expires_at && Date.parse(String(row.expires_at)) <= Date.now())
+        ) {
+          throw new ApiKeyIssuanceConflictError();
+        }
+        keyId = receipt.api_key_id;
+        persistedRow = row;
+        replayed = true;
+        return;
+      }
+    }
+    stmt.insertKey.run(
+      apiKey.id,
+      apiKey.name,
+      apiKey.key,
+      apiKey.machineId,
+      JSON.stringify(apiKey.allowedModels),
+      JSON.stringify(apiKey.allowedCombos),
+      JSON.stringify(allowedConnections),
+      apiKey.noLog ? 1 : 0,
+      apiKey.createdAt,
+      apiKey.key.slice(0, 12),
+      keyHash,
+      JSON.stringify(scopes)
+    );
+    db.prepare(
+      `UPDATE api_keys SET model_access_mode = ?, allow_usage_command = ?,
+      usage_limit_enabled = ?, daily_usage_limit_usd = ?, weekly_usage_limit_usd = ?,
+      chaos_mode_enabled = ?, is_active = COALESCE(?, is_active),
+      compression_enabled = COALESCE(?, compression_enabled) WHERE id = ?`
+    ).run(
+      policy.modelAccessMode,
+      policy.allowUsageCommand ? 1 : 0,
+      policy.usageLimitEnabled ? 1 : 0,
+      policy.dailyUsageLimitUsd,
+      policy.weeklyUsageLimitUsd,
+      policy.chaosModeEnabled ? 1 : 0,
+      policy.isActive === undefined ? null : Number(policy.isActive),
+      policy.compressionEnabled === undefined ? null : Number(policy.compressionEnabled),
+      apiKey.id
+    );
+    if (options.idempotencyKey) {
+      db.prepare(
+        `INSERT INTO api_key_issuances
+        (idempotency_key, request_hash, api_key_id, key_hash, created_at) VALUES (?, ?, ?, ?, ?)`
+      ).run(options.idempotencyKey, requestHash, apiKey.id, keyHash, now);
+    }
+    if (options.prepaidEnabled === true) createPrepaidAccount(apiKey.id);
+    persistedRow = stmt.getKeyById.get(keyId);
+    if (!persistedRow) throw new ApiKeyIssuanceConflictError();
+  });
 
-  backupDbFile("pre-write");
-  return apiKey;
+  if (!persistedRow) throw new ApiKeyIssuanceConflictError();
+  const persisted = apiKeyRowView(persistedRow);
+  if (!replayed) backupDbFile("pre-write");
+  return {
+    ...persisted,
+    id: keyId,
+    key: String(persisted.key),
+    name: String(persisted.name),
+    machineId: String(persisted.machineId),
+    createdAt: String(persisted.createdAt),
+    replayed,
+    prepaidEnabled: getPrepaidBalance(keyId) !== null,
+  };
+}
+
+export type ApiKeyCreateOptions = Pick<
+  ApiKeyPermissionsUpdate,
+  | "allowedConnections"
+  | "modelAccessMode"
+  | "allowedModels"
+  | "allowedCombos"
+  | "noLog"
+  | "allowUsageCommand"
+  | "usageLimitEnabled"
+  | "dailyUsageLimitUsd"
+  | "weeklyUsageLimitUsd"
+  | "chaosModeEnabled"
+  | "compressionEnabled"
+  | "isActive"
+> & { idempotencyKey?: string; prepaidEnabled?: boolean };
+
+export class ApiKeyIssuanceConflictError extends Error {
+  constructor() {
+    super("Issuance request conflicts with an existing receipt or retired credential");
+  }
+}
+
+function getLifecycleDb(id: string): ApiKeysDbLike {
+  const db = getDbInstance();
+  if (db.name === ":memory:") return db as ApiKeysDbLike;
+  const durable = db
+    .prepare(
+      `SELECT 1 FROM api_key_issuances WHERE api_key_id = ?
+    UNION ALL SELECT 1 FROM prepaid_accounts WHERE api_key_id = ? LIMIT 1`
+    )
+    .get(id, id);
+  return (durable ? getDurableDbInstance() : db) as ApiKeysDbLike;
 }
 
 export async function regenerateApiKey(id: string) {
-  const db = getDbInstance() as ApiKeysDbLike;
+  const db = getLifecycleDb(id);
   const stmt = getPreparedStatements(db);
   const row = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
   if (!row) return null;
@@ -726,7 +865,7 @@ export async function regenerateApiKey(id: string) {
 
   // Update in DB
   const updateStmt = db.prepare(
-    "UPDATE api_keys SET key = ?, key_hash = ?, key_prefix = ? WHERE id = ?",
+    "UPDATE api_keys SET key = ?, key_hash = ?, key_prefix = ? WHERE id = ?"
   );
   updateStmt.run(newKey, newHash, newPrefix, id);
 
@@ -747,9 +886,9 @@ export async function regenerateApiKey(id: string) {
 
 export async function updateApiKeyPermissions(
   id: string,
-  update: string[] | ApiKeyPermissionsUpdate,
+  update: string[] | ApiKeyPermissionsUpdate
 ) {
-  const db = getDbInstance() as ApiKeysDbLike;
+  const db = getLifecycleDb(id);
   getPreparedStatements(db);
 
   const normalized = normalizeApiKeyPermissionsUpdate(update);
@@ -1050,7 +1189,9 @@ export async function updateApiKeyPermissions(
         return false;
       }
       assertExclusiveLeaseKeyPolicy(parseStringList(row.scopes), normalized.allowedConnections);
-      const upd = db.prepare(`UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id`).run(params);
+      const upd = db
+        .prepare(`UPDATE api_keys SET ${updates.join(", ")} WHERE id = @id`)
+        .run(params);
       changedRows = upd.changes ?? 0;
       db.exec("COMMIT");
     } catch (err) {
@@ -1131,7 +1272,7 @@ export async function updateApiKeyPermissions(
 }
 
 export async function deleteApiKey(id: string) {
-  const db = getDbInstance() as ApiKeysDbLike;
+  const db = getLifecycleDb(id);
   const stmt = getPreparedStatements(db);
   const row = stmt.getKeyById.get(id) as ApiKeyRow | undefined;
   const result = stmt.deleteKey.run(id);
@@ -1157,12 +1298,12 @@ export async function deleteApiKey(id: string) {
  * (or sooner because invalidateCaches() runs here).
  */
 export async function revokeApiKey(id: string): Promise<boolean> {
-  const db = getDbInstance() as ApiKeysDbLike;
+  const db = getLifecycleDb(id);
   getPreparedStatements(db);
 
   const result = db
     .prepare(
-      "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, @ts), is_active = 0 WHERE id = @id",
+      "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, @ts), is_active = 0 WHERE id = @id"
     )
     .run({ id, ts: new Date().toISOString() });
 
@@ -1178,7 +1319,7 @@ export async function revokeApiKey(id: string): Promise<boolean> {
  * Set or clear the expiry of an API key. Pass null to remove the expiry.
  */
 export async function setApiKeyExpiry(id: string, expiresAt: string | null): Promise<boolean> {
-  const db = getDbInstance() as ApiKeysDbLike;
+  const db = getLifecycleDb(id);
   getPreparedStatements(db);
 
   const result = db
@@ -1291,7 +1432,7 @@ export async function validateApiKey(key: string | null | undefined) {
             revokedAt: row.revoked_at,
           }),
           "EX",
-          3600, // 1 hour cache
+          3600 // 1 hour cache
         );
       }
     } catch {
@@ -1308,7 +1449,7 @@ export async function validateApiKey(key: string | null | undefined) {
  * Get API key metadata with caching for performance
  */
 export async function getApiKeyMetadata(
-  key: string | null | undefined,
+  key: string | null | undefined
 ): Promise<ApiKeyMetadata | null> {
   if (!key || typeof key !== "string") return null;
 
@@ -1415,10 +1556,10 @@ export async function getApiKeyMetadata(
     blockedModels: parseAllowedModels(record.blocked_models ?? record.blockedModels),
     allowedCombos: parseAllowedCombos(record.allowed_combos ?? record.allowedCombos),
     allowedConnections: parseAllowedConnections(
-      record.allowed_connections ?? record.allowedConnections,
+      record.allowed_connections ?? record.allowedConnections
     ),
     allowedQuotas: parseAllowedQuotas(
-      (record as JsonRecord).allowed_quotas ?? (record as JsonRecord).allowedQuotas,
+      (record as JsonRecord).allowed_quotas ?? (record as JsonRecord).allowedQuotas
     ),
     noLog: parseNoLog(record.no_log ?? record.noLog),
     autoResolve: parseAutoResolve(record.auto_resolve ?? record.autoResolve),
@@ -1440,26 +1581,26 @@ export async function getApiKeyMetadata(
     proxyId:
       typeof record.proxy_id === "string" && record.proxy_id.trim() !== "" ? record.proxy_id : null,
     allowedEndpoints: parseStringList(
-      (record as JsonRecord).allowed_endpoints ?? (record as JsonRecord).allowedEndpoints,
+      (record as JsonRecord).allowed_endpoints ?? (record as JsonRecord).allowedEndpoints
     ),
     streamDefaultMode: parseStreamDefaultMode(
-      (record as JsonRecord).stream_default_mode ?? (record as JsonRecord).streamDefaultMode,
+      (record as JsonRecord).stream_default_mode ?? (record as JsonRecord).streamDefaultMode
     ),
     cacheDefaultMode: parseCacheDefaultMode(
       (record as JsonRecord).cache_default_mode ?? (record as JsonRecord).cacheDefaultMode
     ),
     disableNonPublicModels: parseDisableNonPublicModels(
       (record as JsonRecord).disable_non_public_models ??
-        (record as JsonRecord).disableNonPublicModels,
+        (record as JsonRecord).disableNonPublicModels
     ),
     allowUsageCommand: parseAllowUsageCommand(
-      (record as JsonRecord).allow_usage_command ?? (record as JsonRecord).allowUsageCommand,
+      (record as JsonRecord).allow_usage_command ?? (record as JsonRecord).allowUsageCommand
     ),
     chaosModeEnabled: parseChaosModeEnabled(
-      (record as JsonRecord).chaos_mode_enabled ?? (record as JsonRecord).chaosModeEnabled,
+      (record as JsonRecord).chaos_mode_enabled ?? (record as JsonRecord).chaosModeEnabled
     ),
     compressionEnabled: parseCompressionEnabled(
-      (record as JsonRecord).compression_enabled ?? (record as JsonRecord).compressionEnabled,
+      (record as JsonRecord).compression_enabled ?? (record as JsonRecord).compressionEnabled
     ),
     ...parseApiKeyUsageLimitFields(record as JsonRecord),
   };
@@ -1485,7 +1626,7 @@ export async function getApiKeyMetadata(
  */
 export async function isModelAllowedForKey(
   key: string | null | undefined,
-  modelId: string | null | undefined,
+  modelId: string | null | undefined
 ) {
   // If no key provided, allow (request may be using different auth method like JWT)
   // If no modelId provided, deny (invalid request)

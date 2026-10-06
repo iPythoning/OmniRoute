@@ -17,6 +17,7 @@ export interface SearchProviderConfig {
   name: string;
   baseUrl: string;
   method: "GET" | "POST";
+  transport?: "mcp";
   authType: "apikey" | "none";
   authHeader: string;
   costPerQuery: number;
@@ -252,6 +253,7 @@ export const SEARCH_PROVIDERS: Record<string, SearchProviderConfig> = {
 
   "zai-search": {
     id: "zai-search",
+    transport: "mcp",
     name: "Z.AI Coding Plan Search",
     baseUrl: "https://api.z.ai/api/mcp/web_search_prime/mcp",
     method: "POST",
